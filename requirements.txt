@@ -1,0 +1,6 @@
+# Runtime dependencies for VERA Memory V5 (semantic search)
+# The core plugin (SQLite + FTS5, extraction, retrieval) uses only the
+# Python standard library. These two packages power the optional ONNX
+# semantic backend. Without them VERA runs in lexical-only mode.
+onnxruntime>=1.16
+numpy>=1.24

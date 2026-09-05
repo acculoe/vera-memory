@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets (NEVER commit)
+.env
+*.pem
+*.key
+auth.json
+
+# Databases — memory content is private, never commit it
+*.db
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# ONNX models (downloaded at runtime, not committed)
+plugin/models/*.onnx
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Backup artifacts
+*.bak-*
+.curator_backups/
+
+# Virtual environments
+.venv/
+venv/
