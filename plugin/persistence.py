@@ -19,6 +19,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:  # v5.5: dictation repair lives with the Jev gate, not duplicated here.
+    if __package__:
+        from .classify import clean_dictation as classify_clean
+    else:
+        from classify import clean_dictation as classify_clean
+except Exception:  # pragma: no cover - degrade to raw text, never block
+    def classify_clean(text: str) -> str:
+        return " ".join((text or "").split())
+
 logger = logging.getLogger(__name__)
 
 # Categories that PERSIST across sessions
@@ -61,7 +70,46 @@ EPHEMERAL_SIGNALS = (
     "screenshot", "captured", "scrolled",
 )
 
-MAX_PERSISTENCE_CHARS = 1500
+MAX_PERSISTENCE_CHARS = 2500
+# v5.5: per-entry cap raised from 200 and made sentence-aware. The old
+# `entry[:197] + "..."` chopped mid-word, so every long entry ended in
+# unusable fragments ("...keep all the stuff related to bu..."). A memory
+# that cannot be read on sight is not working memory.
+MAX_ENTRY_CHARS = 400
+# v5.5: seed/placeholder bullets that carry no information. They were being
+# round-tripped forever and, worse, the briefing reported "Active task:
+# (none)" as if it were real state.
+PLACEHOLDER_ENTRIES = frozenset({
+    "(none)",
+    "none",
+    "n/a",
+    "tbd",
+    "todo",
+    "-",
+    "(add your preferences here)",
+    "(add your active task here)",
+    "add your preferences here",
+})
+
+
+def _truncate_entry(entry: str, limit: int = MAX_ENTRY_CHARS) -> str:
+    """Truncate at a sentence or word boundary — never mid-word."""
+    text = " ".join((entry or "").split())
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    # Prefer the last sentence end inside the window.
+    for stop in (". ", "! ", "? ", "; ", ", "):
+        idx = window.rfind(stop)
+        if idx >= int(limit * 0.5):
+            return window[: idx + 1].rstrip()
+    # Otherwise fall back to the last whole word.
+    return (window.rsplit(" ", 1)[0] if " " in window else window).rstrip(" ,;:") + "…"
+
+
+def _is_placeholder(entry: str) -> bool:
+    """True for seed bullets that should never be treated as real memory."""
+    return " ".join((entry or "").split()).casefold().strip(" .") in PLACEHOLDER_ENTRIES
 SECTION_HEADERS = (
     "Active Task",
     "Owner Preferences",
@@ -81,7 +129,11 @@ def _content_hash(text: str) -> str:
 
 
 def _parse_persistence_md(content: str) -> Dict[str, List[str]]:
-    """Parse persistence.md into {section: [entries]}."""
+    """Parse persistence.md into {section: [entries]}.
+
+    v5.5: placeholder bullets are dropped on read so they cannot round-trip
+    through a load/write cycle and never reach the session briefing.
+    """
     sections: Dict[str, List[str]] = {}
     current = "General"
     for line in content.split("\n"):
@@ -90,29 +142,36 @@ def _parse_persistence_md(content: str) -> Dict[str, List[str]]:
             current = stripped[3:].strip()
             sections.setdefault(current, [])
         elif stripped.startswith("- ") and current:
-            sections[current].append(stripped[2:].strip())
+            entry = stripped[2:].strip()
+            if entry and not _is_placeholder(entry):
+                sections[current].append(entry)
     return sections
 
 
 def _build_persistence_md(sections: Dict[str, List[str]]) -> str:
-    """Build persistence.md content from sections dict."""
+    """Build persistence.md content from sections dict.
+
+    v5.5: sentence-aware truncation instead of a hard 197-char chop, and
+    placeholder bullets are never rendered back out.
+    """
     lines = []
     for section in SECTION_HEADERS:
         entries = sections.get(section, [])
+        entries = [e for e in entries if e and not _is_placeholder(e)]
         if entries:
             lines.append(f"## {section}")
             for entry in entries:
-                # Truncate long entries
-                display = entry[:197] + "..." if len(entry) > 200 else entry
-                lines.append(f"- {display}")
+                lines.append(f"- {_truncate_entry(entry)}")
             lines.append("")
     # Add any sections not in the predefined order
     for section, entries in sections.items():
         if section not in SECTION_HEADERS and entries:
+            entries = [e for e in entries if e and not _is_placeholder(e)]
+            if not entries:
+                continue
             lines.append(f"## {section}")
             for entry in entries:
-                display = entry[:197] + "..." if len(entry) > 200 else entry
-                lines.append(f"- {display}")
+                lines.append(f"- {_truncate_entry(entry)}")
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -187,10 +246,18 @@ class PersistentMemoryManager:
         return False
 
     def add_entry(self, memory: Dict[str, Any]) -> bool:
-        """Add a memory entry if it should persist. Returns True if added."""
-        content = memory.get("content", "").strip()
+        """Add a memory entry if it should persist. Returns True if added.
+
+        v5.5: the caller arrives already Jev-classified (see classify.py), so
+        this method's job is admission control — not re-guessing the category.
+        Placeholder bullets and too-short content are rejected outright.
+        """
+        content = classify_clean(memory.get("content", ""))
         category = memory.get("category", "general")
         importance = memory.get("importance", 0.5)
+
+        if not content or _is_placeholder(content):
+            return False
 
         if not self.should_persist(content, category, importance):
             return False
@@ -307,15 +374,21 @@ class PersistentMemoryManager:
         return sections
 
     def _enforce_limit(self) -> None:
-        """Keep total content under max_chars."""
+        """Keep total content under max_chars.
+
+        v5.5 fix: this evicted the NEWEST entry from each section (`list.pop()`
+        removes the last element) while the docstring claimed it removed the
+        oldest — so recent, still-relevant entries were dropped first and stale
+        ones accumulated. It now evicts the oldest first, which is what
+        between-session working memory actually needs.
+        """
         content = _build_persistence_md(self._sections)
         while len(content) > self.max_chars and self._entries:
-            # Remove oldest entry from the least important section
             removed = False
             for section in reversed(SECTION_HEADERS):
                 entries_in_section = self._sections.get(section, [])
                 if entries_in_section:
-                    removed_entry = entries_in_section.pop()
+                    removed_entry = entries_in_section.pop(0)  # oldest first
                     self._entries = [
                         e for e in self._entries
                         if e["content"] != removed_entry
@@ -408,6 +481,24 @@ class WorkingMemoryBuffer:
         self.entries.insert(0, entry)
         # Keep only recent N
         self.entries = self.entries[:self.max_entries]
+
+    def remove(self, content: str) -> bool:
+        """v5.5: drop a just-withdrawn fact from this session's working memory.
+
+        Without this, `vera_forget` stopped retrieval in SQLite while the
+        in-session buffer kept echoing the retracted fact until the session
+        ended — the owner would be told a memory was withdrawn and then see
+        it again in the very next prefetch.
+        """
+        target = " ".join((content or "").split()).casefold()
+        if not target:
+            return False
+        before = len(self.entries)
+        self.entries = [
+            e for e in self.entries
+            if " ".join(str(e.get("content", "")).split()).casefold() != target
+        ]
+        return len(self.entries) != before
 
     def get_relevant(self, query: str, max_chars: int = 300) -> str:
         """Get entries relevant to the current query.

@@ -25,6 +25,18 @@ BRIEFING_MAX_CHARS = 600  # ~150 tokens
 ACTIVE_TASK_HEADER = "## Active Task"
 
 
+_PLACEHOLDER_LINES = frozenset({
+    "(none)", "none", "n/a", "tbd", "todo", "-",
+    "(add your preferences here)", "(add your active task here)",
+    "add your preferences here",
+})
+
+
+def _is_placeholder_line(line: str) -> bool:
+    """Seed bullets are scaffolding, not state."""
+    return " ".join(line.split()).casefold().strip(" .") in _PLACEHOLDER_LINES
+
+
 def build_session_briefing(
     db,
     persistence_lines: Iterable[str],
@@ -46,9 +58,14 @@ def build_session_briefing(
 
     for line in persistence_lines:
         line = (line or "").strip()
-        if line and len(line) < 300:
-            parts.append(f"Active task: {line}")
-            break  # only the top active-task line
+        # v5.5: never report a placeholder as real state. The briefing used to
+        # inject "Active task: (none)" / "(add your preferences here)" because
+        # nothing filtered seed bullets — the agent then opened sessions
+        # believing there was no task in flight while one was.
+        if not line or len(line) >= 300 or _is_placeholder_line(line):
+            continue
+        parts.append(f"Active task: {line}")
+        break  # only the top real active-task line
 
     if not parts:
         return ""
@@ -110,8 +127,10 @@ class BriefingPersistence:
                 current_section = stripped[3:].strip()
                 continue
             if current_section == "Active Task" and stripped.startswith("- "):
-                best = stripped[2:].strip()
-                break
+                candidate = stripped[2:].strip()
+                if candidate and not _is_placeholder_line(candidate):
+                    best = candidate
+                    break
         return best
 
     def set_active_task(self, task: str) -> bool:

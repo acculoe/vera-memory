@@ -36,6 +36,7 @@ A memory system only pays off if the agent follows fixed rules. These are ours, 
 | `vera_search(query, category?, limit?)` | Before claims, after gaps | FTS5 + semantic hybrid; category is one of `decisions, facts, preferences, corrections, research, tasks` |
 | `vera_store(content, category?)` | The moment truth happens | Storing a correction automatically supersedes the stale fact it corrects |
 | `vera_context(topic)` | Session start, topic focus | Returns a focused context block, or an honest "no relevant context found" — never silence |
+| `vera_forget(memory_id, reason)` | Owner retracts a fact | Sets `withdrawn`: gone from every index instantly, row kept in SQLite with reason + actor for audit. For owners/operators only — agents don't self-edit history |
 
 **Corrections are first-class.** When you learn something contradicts a stored memory, `vera_store` the corrected fact — the supersede-on-store mechanism demotes the stale one automatically. Don't try to "edit" old memories.
 

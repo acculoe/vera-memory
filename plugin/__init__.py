@@ -26,6 +26,7 @@ if __package__:
     from . import briefing as briefing_mod
     from . import corrections
     from . import summarizer
+    from . import classify as classify_mod
 else:  # Direct source-tree import used by the isolated regression harness.
     from extractor import extract_facts_from_turn
     from migrator import migrate_vera_files
@@ -38,6 +39,7 @@ else:  # Direct source-tree import used by the isolated regression harness.
     import briefing as briefing_mod
     import corrections
     import summarizer
+    import classify as classify_mod
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,9 @@ class VERAMemoryProvider(MemoryProvider):
         self._turn_count: int = 0
         self._extraction_enabled: bool = True
         self._max_prefetch_chars: int = 3000
+        # v5.6: reserved slice of the ~1100-char injection budget for the
+        # ledger 'seen before' tier (owner-approved knob, plan Q2).
+        self._recall_budget_chars: int = 300
         self._semantic_backend: Any = None
         self._persistence: Optional[PersistentMemoryManager] = None
         self._working_buffer: Optional[WorkingMemoryBuffer] = None
@@ -95,7 +100,7 @@ class VERAMemoryProvider(MemoryProvider):
             hermes_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".hermes"
             if not hermes_home.exists():
                 hermes_home = Path.home() / ".hermes"
-            # Handle profile-scoped HERMES_HOME (e.g. profiles/<agent>)
+            # Handle profile-scoped HERMES_HOME (e.g. profiles/phil)
             hermes_str = str(hermes_home).replace("\\", "/")
             if hermes_str.endswith("/profiles") or hermes_str.count("/profiles/") >= 1:
                 # Already points at or below profiles/ — use as-is
@@ -213,15 +218,31 @@ class VERAMemoryProvider(MemoryProvider):
             len(self._persistence._entries),
         )
 
+        # v5.5: every session starts with a fresh Jev classification budget
+        # so a long session cannot starve the judge (and vice versa).
+        try:
+            classify_mod.reset_budget()
+        except Exception as e:  # pragma: no cover
+            logger.debug("VERA v5.5: classify budget reset skipped: %s", e)
+
         # V5: Build the session-start briefing ONCE (prompt-cache safe).
         # Last ended session topic + current Active Task from persistence.md.
         try:
+            # v5.5 BUG FIX: the section is named "Active Task"
+            # (persistence.SECTION_HEADERS). v5 asked for "Active Project",
+            # which does not exist, so this always evaluated to [] and the
+            # briefing's "Active task:" line NEVER reached the agent — every
+            # session opened believing nothing was in flight. Placeholder
+            # bullets are filtered too, so "(none)" is never reported as state.
+            _active_task_lines: List[str] = []
+            if getattr(self._persistence, "get_section", None):
+                _active_task_lines = [
+                    line
+                    for line in (self._persistence.get_section("Active Task") or [])
+                    if line and not briefing_mod._is_placeholder_line(line)
+                ]
             self._briefing_cache = briefing_mod.build_session_briefing(
-                self._db,
-                [self._persistence.get_section("Active Project")[0]]
-                if getattr(self._persistence, "get_section", None)
-                and self._persistence.get_section("Active Project")
-                else [],
+                self._db, _active_task_lines[:1],
             )
             if self._briefing_cache:
                 logger.info("VERA v5: session briefing built")
@@ -287,15 +308,30 @@ class VERAMemoryProvider(MemoryProvider):
                 "type": "function",
                 "function": {
                     "name": "vera_store",
-                    "description": "Explicitly store an important fact in VERA memory.",
+                    "description": "Explicitly store an important fact in VERA memory. For a memory about a NAMED ENTITY, lead the first line with canonical name + aliases: 'Jev (TypeSafe AI System One decision model): ...' - this is what makes later recall work.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "content": {"type": "string", "description": "The fact to store"},
+                            "content": {"type": "string", "description": "The fact to store. Entity memories: first line = canonical name + parenthetical aliases"},
                             "category": {"type": "string", "description": "Category"},
                             "importance": {"type": "number", "description": "0.0-1.0"},
                         },
                         "required": ["content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "vera_forget",
+                    "description": "Withdraw a memory so it is no longer retrievable. Use when the owner retracts, corrects to death, or no longer wants a stored fact recalled. The row is kept for audit; only retrieval stops.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "memory_id": {"type": "integer", "description": "Exact memory id to withdraw (from a prior vera_store/vera_search)"},
+                            "query": {"type": "string", "description": "Search text to locate the memory when the id is unknown"},
+                            "reason": {"type": "string", "description": "Why it is being withdrawn; recorded in the audit trail"},
+                        },
                     },
                 },
             },
@@ -364,18 +400,49 @@ class VERAMemoryProvider(MemoryProvider):
                     return "Error: content is required"
                 if not authenticated or principal_id is None:
                     return "Error: authenticated, provisioned sender is required to store memory"
+                # v5.5: THE JEV GATE. One judge call decides how this memory
+                # is filed (category), how much it weighs (importance) and
+                # repairs speech-to-text artifacts in the text — the same
+                # classification then feeds persistence.md below, so the
+                # store and the working-memory file can never disagree.
+                #
+                # caller_asserted=True: an explicit vera_store is somebody
+                # deliberately remembering something, so the judge may
+                # re-categorize/re-weight but may NOT drop it. Gating an
+                # intentional store would silently lose owner intent — the
+                # automatic path (sync_turn) is where skip is enforced.
+                hint = args.get("category")
+                verdict = classify_mod.classify(
+                    content, category_hint=hint, caller_asserted=True
+                )
+                clean_content = verdict["cleaned"] or content.strip()
+                if verdict["source"] == "jev":
+                    category = verdict["category"]
+                else:
+                    # Judge unavailable -> regex is only a guess, so an
+                    # explicit category from the caller always wins over it.
+                    category = hint if hint in classify_mod.CATEGORIES else verdict["category"]
+                supplied = args.get("importance")
+                try:
+                    importance = (
+                        float(supplied)
+                        if supplied is not None
+                        else verdict["importance"]
+                    )
+                except (TypeError, ValueError):
+                    importance = verdict["importance"]
                 # V5: explicit stores now resolve corrections — a near-match
                 # active memory is superseded instead of silently co-existing.
                 result = corrections.store_with_resolution(
                     self._db,
-                    content=content,
-                    category=args.get("category", "general"),
+                    content=clean_content,
+                    category=category,
                     trust_tier="owner_declared",
                     source_type="authenticated_tool",
                     subject_principal_id=principal_id,
                     sender_principal_id=principal_id,
                     source_session=self._session_id,
-                    importance=float(args.get("importance", 0.5)),
+                    importance=importance,
                 )
                 memory_id = result["memory_id"]
                 if result["action"] == "superseded":
@@ -391,16 +458,72 @@ class VERAMemoryProvider(MemoryProvider):
                         source="explicit_store",
                     )
                 if self._persistence:
+                    # Same Jev-classified payload the database just got, so
+                    # persistence.md reflects what was actually stored rather
+                    # than a second, independent guess.
                     self._persistence.add_entry({
-                        "content": content,
-                        "category": args.get("category", "general"),
-                        "importance": args.get("importance", 0.5),
+                        "content": clean_content,
+                        "category": category,
+                        "importance": importance,
                     })
                     try:
                         self._persistence.write()
                     except Exception as e:
                         logger.debug("VERA v4.5: Post-store persistence write failed: %s", e)
-                return f"Memory stored (id: {memory_id})."
+                return (
+                    f"Memory stored (id: {memory_id}, category: {category}, "
+                    f"importance: {importance}, judge: {verdict['source']})."
+                )
+            elif tool_name == "vera_forget":
+                # v5.5: withdrawal was the one missing verb — you could store
+                # and search but never retract. Locate by id, or by query when
+                # only the text is known, then withdraw under the same
+                # authentication gate the store path uses.
+                memory_id = args.get("memory_id")
+                if memory_id is None:
+                    query = str(args.get("query", "") or "")
+                    if not query.strip():
+                        return "Error: provide memory_id or query"
+                    if not authenticated or principal_id is None:
+                        return "Error: authenticated, provisioned sender is required to withdraw memory"
+                    hits = search(
+                        self._db, query, limit=5,
+                        principal_id=principal_id,
+                        authenticated=authenticated and principal_id is not None,
+                        semantic_backend=self._semantic_backend,
+                    )
+                    if not hits:
+                        return "No matching memory found to withdraw."
+                    if len(hits) > 1:
+                        listed = "\n".join(
+                            f"- id {h.get('id')}: {str(h.get('content',''))[:90]}"
+                            for h in hits
+                        )
+                        return (
+                            "Multiple matches — reply with the exact memory_id to withdraw:\n"
+                            + listed
+                        )
+                    memory_id = hits[0].get("id")
+                withdrawal = self._db.withdraw_memory(
+                    int(memory_id),
+                    reason=str(args.get("reason", "") or ""),
+                    actor=getattr(self, "_agent_identity", "") or "agent",
+                    principal_id=principal_id,
+                    authenticated=authenticated and principal_id is not None,
+                )
+                if withdrawal.get("action") != "withdrawn":
+                    return f"Withdrawal not applied: {withdrawal.get('error', withdrawal.get('action'))}"
+                # Drop it from working memory too, so this session stops
+                # echoing a fact the owner just retracted.
+                if self._working_buffer:
+                    try:
+                        self._working_buffer.remove(withdrawal.get("content", ""))
+                    except Exception:
+                        pass
+                return (
+                    f"Withdrawn (id: {withdrawal['memory_id']}). It stays in the "
+                    f"record for audit but will no longer be retrieved."
+                )
             elif tool_name == "vera_context":
                 topic = args.get("topic", "")
                 # V5 fix: handle_tool_call already resolved the right principal
@@ -436,6 +559,36 @@ class VERAMemoryProvider(MemoryProvider):
                 sender_principal_id=principal["id"] if principal else None,
                 authenticated=bool(kwargs.get("sender_authenticated", False)),
             )
+            # v5.5: Jev gate on the AUTOMATIC path. This is the valve where
+            # content reaches the store with nobody asserting durability, so
+            # it is where a judge earns its keep: drop non-durable candidates
+            # and repair dictation artifacts. The extractor keeps owning
+            # category/memory_type (they stay consistent with each other) so
+            # a failed judge degrades to exactly v5 behavior instead of
+            # losing memories — classify() falls back to regex, and regex
+            # never drops what the extractor already deemed durable.
+            if extracted:
+                _kept = []
+                _dropped = 0
+                for mem in extracted:
+                    _verdict = classify_mod.classify(
+                        str(mem.get("content", "")),
+                        category_hint=mem.get("category"),
+                        caller_asserted=False,
+                    )
+                    if not _verdict["store"]:
+                        _dropped += 1
+                        continue
+                    if _verdict["cleaned"]:
+                        mem["content"] = _verdict["cleaned"]
+                    _kept.append(mem)
+                if _dropped:
+                    logger.debug(
+                        "VERA v5.5: judge dropped %d non-durable candidate(s) this turn",
+                        _dropped,
+                    )
+                extracted = _kept
+
             if extracted:
                 stored = 0
                 new_ids = []
@@ -586,6 +739,25 @@ class VERAMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("VERA v5: proactive recall skipped: %s", e)
 
+            # V5.6 Tier 4: ledger recall trigger - "seen before". Fires when
+            # the message names a term VERA already holds (the 'who is Jev?'
+            # defect: stores were fine, nothing connected the spoken word to
+            # them). Own budget slice, fail-open: a ledger problem never costs
+            # the other tiers their output.
+            try:
+                from .ledger import recall_trigger
+            except ImportError:  # direct source-tree harness
+                from ledger import recall_trigger  # type: ignore
+            try:
+                seen_ctx = recall_trigger(
+                    query, self._db._get_conn(),
+                    budget=self._recall_budget_chars,
+                )
+                if seen_ctx:
+                    parts.append(seen_ctx)
+            except Exception as e:
+                logger.debug("VERA v5.6 recall trigger skipped: %s", e)
+
             return "\n".join(parts)
         except Exception as e:
             logger.debug("VERA Memory prefetch failed: %s", e)
@@ -602,7 +774,7 @@ class VERAMemoryProvider(MemoryProvider):
         buf_size = len(self._working_buffer) if self._working_buffer else 0
         persist_size = len(self._persistence._entries) if self._persistence else 0
         return (
-            f"## VERA v5 — {count} memories, "
+            f"## VERA v5.5 — {count} memories, "
             f"{buf_size} working, {persist_size} persistent"
         )
 
@@ -665,10 +837,12 @@ class VERAMemoryProvider(MemoryProvider):
         per-message work.
         """
         lines = [
-            "\n## VERA Memory (v5)\n"
-            "Memory system active. `vera_search` to recall, `vera_store` to save.\n"
-            "Facts extracted automatically. Working memory tracks recent context.\n"
-            "Before starting named work, search VERA for that project's context first.\n"
+            "\n## VERA Memory (v5.5)\n"
+            "Memory system active. `vera_search` to recall, `vera_store` to save,\n"
+            "`vera_forget` to withdraw a fact the owner no longer wants recalled.\n"
+            "Facts extracted automatically; a Jev judge classifies what is kept.\n"
+            "Working memory tracks recent context. Before starting named work,\n"
+            "search VERA for that project's context first.\n"
         ]
         if self._briefing_cache:
             lines.append(self._briefing_cache + "\n")

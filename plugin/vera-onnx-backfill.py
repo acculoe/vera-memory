@@ -2,7 +2,7 @@
 """VERA V4 ONNX Embedding Backfill Script
 
 Embeds all existing memories that lack vectors.
-Cross-platform: works on macOS, Linux, and Windows.
+Cross-platform: works on Linux and Windows.
 No external dependencies beyond onnxruntime + numpy (already required by VERA).
 
 Usage:
@@ -199,7 +199,7 @@ def discover_plugin_dir() -> Path:
     for c in candidates:
         if c.exists() and (c / "embedding_adapter.py").exists():
             return c
-    raise FileNotFoundError("Cannot find the vera_memory plugin directory.")
+    raise FileNotFoundError("Cannot find vera_memory plugin directory.")
 
 
 def get_embeddable_memories(conn: sqlite3.Connection) -> List[Tuple[int, str, str]]:

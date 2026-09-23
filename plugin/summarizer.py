@@ -126,7 +126,7 @@ CATEGORY_CONSOLIDATION: Dict[str, str] = {
     "incident": "tasks",
     "backup": "tasks",
     "monitoring": "tasks",
-    # category fragments observed in long-running deployments (25 distinct)
+    # live fragments found in a production DB audit (25 distinct categories)
     "protocols": "facts",
     "lessons": "facts",
     "projects": "tasks",

@@ -16,13 +16,27 @@ import threading
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 8
+# v5.6: term ledger (lowest layer - it imports nothing from this package).
+# Fail-open by design: if ledger.py is ever missing/corrupt, stores and
+# withdrawals must still work; verification (Task 8) fails loudly instead.
+try:  # package import (normal plugin path)
+    from .ledger import purge_terms, record_terms
+except Exception:  # direct source-tree harness
+    try:
+        from ledger import purge_terms, record_terms
+    except Exception:  # pragma: no cover
+        record_terms = None  # type: ignore[assignment]
+        purge_terms = None  # type: ignore[assignment]
+
+SCHEMA_VERSION = 11
 VALID_LAYERS = {"l0", "l1", "l2", "l3"}
-VALID_STATUSES = {"active", "historical", "superseded", "quarantined", "deleted"}
+# v5.5: adds "withdrawn" — a first-class, owner-initiated withdrawal that is
+# distinct from superseded (replaced by a newer fact) and historical (aged out).
+VALID_STATUSES = {"active", "historical", "superseded", "quarantined", "deleted", "withdrawn"}
 VALID_TRUST_TIERS = {
     "canonical",
     "owner_declared",
@@ -56,6 +70,22 @@ TRUST_WEIGHTS = {
     "observed_chat": 0.35,
     "imported_history": 0.25,
 }
+
+# v5.5 — one authoritative mapping between `category` and `memory_type`.
+# These two columns describe the same fact, and before v5.5 they drifted:
+# 422 rows were category='decisions' while memory_type='fact' (the default),
+# 221 preferences filed as facts, 272 corrections filed as facts. The
+# extractor derived category FROM memory_type, but the explicit store path
+# passed category and left memory_type on its default — so the two disagreed
+# for every explicit write. `category` is the caller-facing vocabulary, so
+# memory_type now derives from it whenever the caller did not assert a
+# specific non-default type.
+CATEGORY_TO_TYPE = {
+    "decisions": "decision",
+    "preferences": "preference",
+    "corrections": "correction",
+}
+DEFAULT_MEMORY_TYPE = "fact"
 
 BASE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -372,6 +402,9 @@ class MemoryDB:
             (6, "rebuildable sqlite embedding storage", self._migration_embeddings),
             (7, "versioned layered summary generations", self._migration_layered_summaries),
             (8, "subject scoped retrieval visibility", self._migration_subject_visibility),
+            (9, "vera v5.5 data hygiene: type sync, importance rounding, validity, dedup", self._migration_v55_hygiene),
+        (10, "vera v5.5.1 hash normalization and duplicate lineage closure", self._migration_v551_hash_hygiene),
+        (11, "vera v5.6 term ledger: schema, backfill", self._migration_v56_term_ledger),
         ]
         applied_rows = {
             int(row["version"]): str(row["checksum"])
@@ -500,6 +533,423 @@ class MemoryDB:
                WHERE subject_principal_id IS NULL AND visibility!='profile_global'
                  AND source NOT IN ('explicit', 'local-policy', 'runtime-config')"""
         )
+
+    @staticmethod
+    def _migration_v55_hygiene(conn: sqlite3.Connection) -> None:
+        """VERA v5.5 data hygiene. Owner directive, 2026-09-22.
+
+        Five idempotent repairs against the audited v5 corpus, all reversible
+        from the pre-migration snapshot and all recorded in migration_audit:
+
+        1. importance rounding — removes float slop (73 rows stored as
+           0.7000000000000001) and re-clamps out-of-range values.
+        2. category -> memory_type sync — 422 decisions, 221 preferences and
+           272 corrections were filed as memory_type='fact' because the
+           explicit store path never derived the type from the category.
+        3. valid_from backfill — 68.9% of rows had no temporal validity, which
+           made staleness/gap analysis impossible.
+        4. same-subject exact dedup — identical text, identical created_at,
+           identical subject: the double migration inserted these twice.
+           Cross-subject pairs are NOT merged here; see step 5.
+        5. cross-subject duplicate queueing — 721 groups hold byte-identical
+           content under two different subject principals (owner-subject vs agent-subject,
+           or unbound vs bound). Retrieval does not filter on subject, so
+           both copies currently compete in every query. Which subject's
+           attribution survives is an ownership decision, not a technical
+           one, so those pairs are recorded as OPEN conflict_review rows for
+           owner decision instead of being silently rewritten.
+
+        Content text is never rewritten. The owner's words stay verbatim —
+        a dictation-cleanup pass is a separate, explicitly-approved curation.
+        """
+        now = utcnow()
+        audit: List[Tuple[str, Optional[int], Dict[str, Any], Dict[str, Any]]] = []
+
+        # --- 1. importance rounding ------------------------------------
+        rows = conn.execute(
+            "SELECT id, importance FROM memories WHERE importance IS NULL OR importance < 0 "
+            "OR importance > 1 OR importance != ROUND(importance, 2)"
+        ).fetchall()
+        for rid, old in rows:
+            new = round(max(0.0, min(float(old or 0.5), 1.0)), 2)
+            conn.execute("UPDATE memories SET importance=? WHERE id=?", (new, rid))
+            audit.append(("v55-importance-rounding", int(rid),
+                          {"importance": old}, {"importance": new}))
+
+        # --- 2. category -> memory_type sync ---------------------------
+        rows = conn.execute(
+            """SELECT id, category, memory_type FROM memories
+                WHERE (category='decisions'   AND memory_type != 'decision')
+                   OR (category='preferences' AND memory_type != 'preference')
+                   OR (category='corrections' AND memory_type != 'correction')"""
+        ).fetchall()
+        for rid, category, old_type in rows:
+            new_type = CATEGORY_TO_TYPE[category]
+            conn.execute(
+                "UPDATE memories SET memory_type=? WHERE id=?", (new_type, rid)
+            )
+            audit.append(("v55-memory-type-sync", int(rid),
+                          {"category": category, "memory_type": old_type},
+                          {"category": category, "memory_type": new_type}))
+
+        # --- 3. valid_from backfill ------------------------------------
+        rows = conn.execute(
+            "SELECT id, created_at FROM memories WHERE valid_from IS NULL "
+            "AND created_at IS NOT NULL"
+        ).fetchall()
+        for rid, created in rows:
+            conn.execute(
+                "UPDATE memories SET valid_from=? WHERE id=?", (created, rid)
+            )
+            audit.append(("v55-valid-from-backfill", int(rid),
+                          {"valid_from": None}, {"valid_from": created}))
+
+        # Close the validity window of a row that a later row replaced.
+        rows = conn.execute(
+            """SELECT old.id, new.created_at FROM memories old
+                 JOIN memories new ON new.supersedes_id = old.id
+                WHERE old.valid_to IS NULL"""
+        ).fetchall()
+        for rid, ended in rows:
+            conn.execute("UPDATE memories SET valid_to=? WHERE id=?", (ended, rid))
+            audit.append(("v55-valid-to-backfill", int(rid),
+                          {"valid_to": None}, {"valid_to": ended}))
+
+        # --- 4/5. duplicate handling -----------------------------------
+        # Group only on byte-identical text (after casefold + whitespace
+        # collapse) so we never merge merely-similar rows.
+        grouped: Dict[str, List[sqlite3.Row]] = {}
+        for row in conn.execute(
+            "SELECT id, content, normalized_content, subject_principal_id, trust_tier, "
+            "       category, created_at FROM memories "
+            "WHERE status='active' AND normalized_content IS NOT NULL "
+            "  AND normalized_content != ''"
+        ):
+            grouped.setdefault(row["normalized_content"], []).append(row)
+
+        same_subject_conflicts = 0
+        cross_subject_conflicts = 0
+        for group in grouped.values():
+            if len(group) < 2:
+                continue
+            # Keeper: strongest trust first, then oldest id — deterministic.
+            ordered = sorted(
+                group,
+                key=lambda r: (-TRUST_WEIGHTS.get(r["trust_tier"] or "", 0.0), int(r["id"])),
+            )
+            keeper, losers = ordered[0], ordered[1:]
+
+            # Identical created_at => same source event, i.e. a true re-insert.
+            same_event = len({r["created_at"] for r in group}) == 1
+            keeper_subject = keeper["subject_principal_id"]
+            same_subject = all(
+                r["subject_principal_id"] == keeper_subject for r in group
+            )
+
+            if same_subject and same_event:
+                # Safe: one subject, one event, one surviving copy.
+                for loser in losers:
+                    conn.execute(
+                        "UPDATE memories SET status='superseded', retrieval_enabled=0, "
+                        "valid_to=? WHERE id=?",
+                        (keeper["created_at"], int(loser["id"])),
+                    )
+                    audit.append(
+                        ("v55-dedup-supersede", int(loser["id"]),
+                         {"status": "active", "retrieval_enabled": 1,
+                          "superseded_by": int(keeper["id"])},
+                         {"status": "superseded", "retrieval_enabled": 0,
+                          "superseded_by": int(keeper["id"])})
+                    )
+                    same_subject_conflicts += 1
+                if not conn.execute(
+                    "SELECT 1 FROM memories WHERE supersedes_id=? LIMIT 1",
+                    (int(keeper["id"]),),
+                ).fetchone():
+                    conn.execute(
+                        "UPDATE memories SET supersedes_id=? WHERE id=? AND supersedes_id IS NULL",
+                        (int(losers[0]["id"]), int(keeper["id"])),
+                    )
+            else:
+                # Ownership question — queue, do not decide.
+                for loser in losers:
+                    exists = conn.execute(
+                        "SELECT 1 FROM conflict_review WHERE memory_id_a=? AND memory_id_b=? "
+                        "AND reason LIKE 'v55-identical-content%' LIMIT 1",
+                        (int(loser["id"]), int(keeper["id"])),
+                    ).fetchone()
+                    if not exists:
+                        # Column order is (memory_id_a, memory_id_b, reason,
+                        # status, created_at) — 'open' is a literal and must
+                        # land in `status`, which precedes created_at. Binding
+                        # `now` as the 4th parameter put the timestamp in
+                        # `status` and 'open' in `created_at`, so every future
+                        # `WHERE status='open'` query would have found nothing.
+                        conn.execute(
+                            "INSERT INTO conflict_review "
+                            "(memory_id_a, memory_id_b, reason, status, created_at) "
+                            "VALUES (?,?,?, 'open', ?)",
+                            (int(loser["id"]), int(keeper["id"]),
+                             "v55-identical-content-cross-subject: identical text and "
+                             "created_at under subject %s vs %s; retrieval does not filter "
+                             "on subject, so both copies compete in every query. Owner must "
+                             "choose which subject attribution survives."
+                             % (loser["subject_principal_id"], keeper_subject),
+                             now),
+                        )
+                        cross_subject_conflicts += 1
+
+        # --- record one audit row per step -----------------------------
+        summary = {
+            "version": "5.5",
+            "applied_at": now,
+            "importance_rounded": sum(1 for a in audit if a[0] == "v55-importance-rounding"),
+            "memory_type_synced": sum(1 for a in audit if a[0] == "v55-memory-type-sync"),
+            "valid_from_backfilled": sum(1 for a in audit if a[0] == "v55-valid-from-backfill"),
+            "valid_to_backfilled": sum(1 for a in audit if a[0] == "v55-valid-to-backfill"),
+            "same_subject_superseded": same_subject_conflicts,
+            "cross_subject_queued": cross_subject_conflicts,
+        }
+        conn.execute(
+            "INSERT INTO migration_audit (migration_name, memory_id, before_json, "
+            "after_json, applied_at) VALUES (?,?,?,?,?)",
+            ("vera-v5.5-hygiene", None,
+             json.dumps({"note": "per-row detail recorded as individual audit rows"}),
+             json.dumps(summary), now),
+        )
+        for name, rid, before, after in audit:
+            conn.execute(
+                "INSERT INTO migration_audit (migration_name, memory_id, before_json, "
+                "after_json, applied_at) VALUES (?,?,?,?,?)",
+                (name, rid, json.dumps(before, default=str),
+                 json.dumps(after, default=str), now),
+            )
+
+    @staticmethod
+    def _migration_v551_hash_hygiene(conn: sqlite3.Connection) -> None:
+        """VERA v5.5.1 - canonical content hashes and duplicate lineage closure.
+
+        Owner directive, 2026-09-23. Content text is never rewritten.
+
+        1. content_hash existed in two incompatible formats: 979 legacy 16-char
+           digests that no current algorithm reproduces, alongside canonical
+           64-char content_digest() values. store_memory dedups by comparing a
+           freshly computed 64-char digest against stored values, so legacy
+           rows could never match - exact-duplicate detection was blind for
+           ~40% of the corpus. Every row is rehashed with content_digest() and
+           the canonical value is mirrored into memory_embeddings.content_hash
+           in the SAME transaction, preserving the self_heal staleness
+           invariant (e.content_hash = m.content_hash): zero re-embeddings.
+        2. The nine migration-9 same-subject supersessions were recorded in
+           status but never linked. Every superseded row missing lineage gets
+           memory_links (parent=loser, child=winner,
+           relation='superseded_by'), the pattern of all pre-existing links.
+        3. One same-subject pair stayed active/active: the observed_chat copy
+           is superseded in favour of the owner_declared copy - the same
+           TRUST_WEIGHTS survivor rule migration 9 used.
+
+        Cross-subject conflict_review pairs are untouched: merging across
+        subjects remains the owner's decision.
+        """
+        now = utcnow()
+        audit_sql = (
+            "INSERT INTO migration_audit"
+            " (migration_name, memory_id, before_json, after_json, applied_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+        )
+        name = "vera v5.5.1 hash normalization and duplicate lineage"
+
+        # 1. canonical rehash of memories.content_hash
+        rehashed = 0
+        for mid, content, current in conn.execute(
+            "SELECT id, content, content_hash FROM memories"
+        ).fetchall():
+            canonical = content_digest(content)
+            if canonical != current:
+                conn.execute(
+                    "UPDATE memories SET content_hash=? WHERE id=?", (canonical, mid)
+                )
+                conn.execute(
+                    audit_sql,
+                    (name, mid, json.dumps({"content_hash": current}),
+                     json.dumps({"content_hash": canonical}), now),
+                )
+                rehashed += 1
+
+        # 2. mirror canonical hashes into embeddings (staleness stays green)
+        mirrored = 0
+        for mid, old, canonical in conn.execute(
+            """SELECT e.memory_id, e.content_hash,
+                      (SELECT m.content_hash FROM memories m
+                        WHERE m.id = e.memory_id) AS canonical
+                 FROM memory_embeddings e
+                WHERE e.content_hash <>
+                      (SELECT m.content_hash FROM memories m
+                        WHERE m.id = e.memory_id)"""
+        ).fetchall():
+            if canonical is None:
+                continue
+            conn.execute(
+                "UPDATE memory_embeddings SET content_hash=? WHERE memory_id=?",
+                (canonical, mid),
+            )
+            conn.execute(
+                audit_sql,
+                (name, mid, json.dumps({"embedding.content_hash": old}),
+                 json.dumps({"embedding.content_hash": canonical}), now),
+            )
+            mirrored += 1
+
+        # 3. close same-subject active/active duplicates (migration-9 rule)
+        closed = 0
+        for content, subj in conn.execute(
+            """SELECT content, COALESCE(subject_principal_id, -1)
+                 FROM memories
+                WHERE status='active'
+                GROUP BY content, COALESCE(subject_principal_id, -1)
+               HAVING COUNT(*) > 1"""
+        ).fetchall():
+            ranked = sorted(
+                conn.execute(
+                    """SELECT id, trust_tier, created_at FROM memories
+                        WHERE status='active' AND content=?
+                          AND COALESCE(subject_principal_id, -1)=?""",
+                    (content, subj),
+                ).fetchall(),
+                key=lambda r: (TRUST_WEIGHTS.get(r[1], 0.0), r[2] or "", -r[0]),
+                reverse=True,
+            )
+            for loser in ranked[1:]:
+                winner = ranked[0]
+                conn.execute(
+                    "UPDATE memories SET status='superseded', updated_at=? WHERE id=?",
+                    (now, loser[0]),
+                )
+                conn.execute(
+                    audit_sql,
+                    (name, loser[0], json.dumps({"status": "active"}),
+                     json.dumps({"status": "superseded",
+                                 "superseded_by": winner[0]}), now),
+                )
+                closed += 1
+
+        # 4. lineage backfill: link every superseded row missing its winner
+        linked = 0
+        unlinked = 0
+        for (loser_id,) in conn.execute(
+            """SELECT m.id FROM memories m
+                WHERE m.status='superseded'
+                  AND NOT EXISTS (SELECT 1 FROM memory_links l
+                                   WHERE l.parent_id = m.id
+                                     AND l.relation = 'superseded_by')"""
+        ).fetchall():
+            content, subj = conn.execute(
+                "SELECT content, COALESCE(subject_principal_id, -1)"
+                " FROM memories WHERE id=?",
+                (loser_id,),
+            ).fetchone()
+            ranked = conn.execute(
+                """SELECT id, trust_tier, created_at FROM memories
+                    WHERE status='active' AND content=?
+                      AND COALESCE(subject_principal_id, -1)=?""",
+                (content, subj),
+            ).fetchall()
+            if not ranked:
+                unlinked += 1
+                continue
+            winner = sorted(
+                ranked,
+                key=lambda r: (TRUST_WEIGHTS.get(r[1], 0.0), r[2] or "", -r[0]),
+                reverse=True,
+            )[0]
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_links"
+                " (parent_id, child_id, relation, created_at)"
+                " VALUES (?, ?, 'superseded_by', ?)",
+                (loser_id, winner[0], now),
+            )
+            conn.execute(
+                audit_sql,
+                (name, loser_id, json.dumps({"superseded_by": None}),
+                 json.dumps({"superseded_by": winner[0]}), now),
+            )
+            linked += 1
+
+        logger.info(
+            "vera v5.5.1 hygiene: rehashed=%s mirrored=%s closed=%s linked=%s unlinked=%s",
+            rehashed, mirrored, closed, linked, unlinked,
+        )
+
+    @staticmethod
+    def _migration_v56_term_ledger(conn: sqlite3.Connection) -> None:
+        """VERA v5.6 - term ledger: schema + one-time corpus backfill.
+
+        Owner directive, 2026-09-23. The fix for asking "who is Jev?" about a
+        memory that already exists: entity-grade terms (capitalized spans,
+        acronyms, quoted/backticked spans - leading sentence-starters
+        stripped) keyed per memory with +-40 chars of surrounding context, so
+        the recall trigger answers "mentioned N times since DATE" from two
+        indexed lookups, no LLM, no network.
+
+        Content text is never rewritten. Idempotent: PRIMARY KEY
+        (norm, memory_id) + INSERT OR IGNORE make a re-run a no-op.
+        Fail-open on import death: schema still lands (feature inert), and
+        verification fails loudly if the backfill was skipped. ON DELETE
+        CASCADE gives the hard-delete path a purge safety net; withdraw is
+        purged explicitly in store lifecycle code.
+        """
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS term_ledger (
+                   norm        TEXT NOT NULL,
+                   term        TEXT NOT NULL,
+                   memory_id   INTEGER NOT NULL REFERENCES memories(id)
+                                 ON DELETE CASCADE,
+                   context     TEXT,
+                   recorded_at TEXT NOT NULL,
+                   PRIMARY KEY (norm, memory_id)
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_term_ledger_norm ON term_ledger(norm)"
+        )
+        conn.execute(
+            """CREATE VIEW IF NOT EXISTS term_stats AS
+                   SELECT norm,
+                          COUNT(*)         AS mentions,
+                          MIN(recorded_at) AS first_seen,
+                          MAX(recorded_at) AS last_seen
+                   FROM term_ledger GROUP BY norm"""
+        )
+        name = "vera v5.6 term ledger: schema, backfill"
+        now = utcnow()
+        written = 0
+        if record_terms is None:
+            logger.error("term ledger backfill SKIPPED: ledger module unavailable")
+        else:
+            for mid, content, created in conn.execute(
+                "SELECT id, content, created_at FROM memories"
+            ).fetchall():
+                # recorded_at = when the memory introduced the term, NOT when
+                # the backfill ran - "mentioned since DATE" must be truthful.
+                written += int(record_terms(conn, int(mid), content or "",
+                                            created or now))
+        # Self-heal: every ledger timestamp equals the memory created_at
+        # (also repairs drift from an earlier run of this migration).
+        conn.execute(
+            "UPDATE term_ledger SET recorded_at ="
+            " COALESCE((SELECT m.created_at FROM memories m"
+            "            WHERE m.id = term_ledger.memory_id), recorded_at)"
+        )
+        try:
+            conn.execute(
+                "INSERT INTO migration_audit (migration_name, memory_id,"
+                " before_json, after_json, applied_at) VALUES (?, ?, ?, ?, ?)",
+                (name, None, json.dumps({"term_ledger": "absent"}),
+                 json.dumps({"rows_backfilled": written}), now),
+            )
+        except Exception as e:  # old builds: memory_id NOT NULL -> skip summary
+            logger.info("term ledger summary audit skipped: %s", e)
+        logger.info("vera v5.6 term ledger: %s rows backfilled", written)
 
     @staticmethod
     def _backfill_governance(conn: sqlite3.Connection) -> None:
@@ -868,7 +1318,7 @@ class MemoryDB:
         metadata: Optional[Dict[str, Any]] = None,
         *,
         memory_layer: str = "l1",
-        memory_type: str = "fact",
+        memory_type: Optional[str] = None,
         subject_principal_id: Optional[int] = None,
         trust_tier: Optional[str] = None,
         status: str = "active",
@@ -913,22 +1363,47 @@ class MemoryDB:
             raise ValueError("profile-global memory requires internal high-trust local provenance")
         if effective_visibility == "subject" and subject_principal_id is None:
             retrieval_enabled = False
-        importance = max(0.0, min(float(importance), 1.0))
+        # v5.5: round to 2dp. The live corpus held 73 rows stored as
+        # 0.7000000000000001 — float slop from caller-side arithmetic that
+        # never belonged in the record. Clamp first, then round.
+        importance = round(max(0.0, min(float(importance), 1.0)), 2)
+        # v5.5: memory_type derives from category unless the caller asserted a
+        # specific non-default type (summaries pass memory_type="summary" and
+        # are preserved). This closes the category/memory_type drift where the
+        # explicit store path left memory_type on its "fact" default while
+        # category said "decisions"/"preferences"/"corrections".
+        if memory_type is None or memory_type == DEFAULT_MEMORY_TYPE:
+            memory_type = CATEGORY_TO_TYPE.get(category, DEFAULT_MEMORY_TYPE)
         normalized = normalize_content(clean)
         digest = content_digest(clean)
         now = utcnow()
 
         with self._lock:
             conn = self._get_conn()
+            # v5.6.1: exact-hash dedupe is SUBJECT-FREE (owner directive,
+            # 2026-09-23). The pre-5.6.1 lookup also matched
+            # subject_principal_id, so identical content written under two
+            # subjects (owner vs agent) bypassed the guard and became a
+            # second active row — 722 cross-subject pairs in the v5.5 audit,
+            # each pair competing for the same recall slots. Attribution of
+            # a surviving cross-subject duplicate stays with the first
+            # writer; only a same-subject match gets the trust upgrade.
             existing = conn.execute(
-                """SELECT id FROM memories
+                """SELECT id, subject_principal_id FROM memories
                    WHERE content_hash=? AND status='active'
-                     AND COALESCE(subject_principal_id, -1)=COALESCE(?, -1)
+                   ORDER BY (COALESCE(subject_principal_id, -1)=COALESCE(?, -1)) DESC, id ASC
                    LIMIT 1""",
                 (digest, subject_principal_id),
             ).fetchone()
             if existing and deduplicate:
                 existing_id = int(existing["id"])
+                if existing["subject_principal_id"] != subject_principal_id:
+                    logger.info(
+                        "vera v5.6.1: cross-subject exact duplicate (hash=%s, incoming subject=%s): "
+                        "returning existing id %s with first-writer attribution",
+                        digest[:12], subject_principal_id, existing_id,
+                    )
+                    return existing_id
                 existing_row = conn.execute(
                     "SELECT trust_tier, importance, retrieval_enabled, visibility FROM memories WHERE id=?",
                     (existing_id,),
@@ -994,6 +1469,15 @@ class MemoryDB:
                         digest,
                     ),
                 )
+                # v5.6: term ledger, SAME transaction. Fail-open on purpose:
+                # a ledger problem must never lose a store (verification
+                # catches a silent skip loudly instead).
+                if record_terms is not None:
+                    try:
+                        record_terms(conn, memory_id, clean, now)
+                    except Exception as e:
+                        logger.warning("term ledger write skipped for %s: %s",
+                                       memory_id, e)
                 if supersedes_id:
                     self._supersede_locked(conn, supersedes_id, memory_id, now)
                 if commit:
@@ -1113,6 +1597,101 @@ class MemoryDB:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def withdraw_memory(
+        self,
+        memory_id: int,
+        *,
+        reason: str = "",
+        actor: str = "",
+        principal_id: Optional[int] = None,
+        authenticated: bool = False,
+    ) -> Dict[str, Any]:
+        """VERA v5.5 — owner-initiated withdrawal.
+
+        The gap this closes: before v5.5 an agent could STORE but never
+        FORGET. `status` and `retrieval_enabled` existed, `supersedes_id`
+        existed, but no tool path exposed them — so a fact the owner retracted
+        stayed retrievable forever.
+
+        Semantics (deliberately distinct from the two neighbouring states):
+          superseded  — a newer fact replaced it (handled by corrections.py)
+          historical  — aged out of the hot window
+          withdrawn   — the owner said this should no longer be recalled
+
+        The row is never deleted: SQLite stays the canonical record, the
+        withdrawal is auditable in migration_audit, and the reason is kept so
+        a future session can see WHY something stopped being true.
+
+        Authorization mirrors store/get: an authenticated, provisioned
+        principal is required, and the row must already be visible to that
+        principal. No elevated path, no cross-principal withdrawal.
+        """
+        if not authenticated or principal_id is None:
+            return {
+                "action": "denied",
+                "memory_id": int(memory_id),
+                "error": "authenticated, provisioned sender is required to withdraw memory",
+            }
+        visible = self.get_active_memories_by_ids(
+            [int(memory_id)], principal_id=principal_id, authenticated=True
+        )
+        if not visible:
+            return {
+                "action": "not_found",
+                "memory_id": int(memory_id),
+                "error": "no active memory with that id is visible to this principal",
+            }
+        row = visible[0]
+        now = utcnow()
+        before = {
+            "status": row.get("status"),
+            "retrieval_enabled": row.get("retrieval_enabled"),
+            "trust_tier": row.get("trust_tier"),
+            "reason": None,
+        }
+        after = {
+            "status": "withdrawn",
+            "retrieval_enabled": 0,
+            "trust_tier": row.get("trust_tier"),
+            "reason": reason or "",
+            "actor": actor or "",
+        }
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "UPDATE memories SET status='withdrawn', retrieval_enabled=0, "
+                "valid_to=?, updated_at=? WHERE id=?",
+                (now, now, int(memory_id)),
+            )
+            conn.execute(
+                "INSERT INTO migration_audit "
+                "(migration_name, memory_id, before_json, after_json, applied_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    "vera-forget",
+                    int(memory_id),
+                    json.dumps(before, sort_keys=True),
+                    json.dumps(after, sort_keys=True),
+                    now,
+                ),
+            )
+            # v5.6: withdrawn means gone from every index - purge the ledger.
+            # Not fail-open: a half-withdrawal is worse than a failed one.
+            if purge_terms is not None:
+                purge_terms(conn, int(memory_id))
+            conn.commit()
+        logger.info(
+            "VERA v5.5: memory %s withdrawn (reason=%r actor=%r)",
+            memory_id, reason[:120], actor[:60],
+        )
+        return {
+            "action": "withdrawn",
+            "memory_id": int(memory_id),
+            "content": str(row.get("content", ""))[:200],
+            "previous_status": before["status"],
+            "reason": reason or "",
+        }
+
     def get_memory(
         self, memory_id: int, *, principal_id: Optional[int] = None, authenticated: bool = False
     ) -> Optional[Dict[str, Any]]:
@@ -1154,6 +1733,10 @@ class MemoryDB:
                    valid_to=?, updated_at=? WHERE id=? AND status!='deleted'""",
                 (utcnow(), utcnow(), int(memory_id)),
             )
+            # v5.6: soft-delete - status change never fires the FK CASCADE,
+            # so purge explicitly (same contract as withdraw).
+            if purge_terms is not None:
+                purge_terms(self._get_conn(), int(memory_id))
             self._get_conn().commit()
             return cursor.rowcount > 0
 

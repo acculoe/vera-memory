@@ -68,6 +68,31 @@ If step 2 fails with *"authenticated, provisioned sender is required"* — the i
 - The plugin auto-detects profile-scoped `HERMES_HOME` — no path config needed. It also handles Windows-style paths (backslash normalization is built in).
 - A profile with legacy `vera/memory/*.md` files will **refuse to start** VERA until an explicit offline migration is done (by design — startup never mutates your history as a side effect).
 
+## Optional: the classification judge (Jev or a compatible open-weight model)
+
+Since 5.5, VERA can gate the automatic extraction path with an LLM judge that
+decides *store-or-skip* and *category* before content enters the durable
+store. **The reference judge is [Jev](https://openrouter.ai/typesafe/jev-1.13)
+(`typesafe/jev-1.13`); any other open-weight AI of the same type works** as
+long as it is exposed behind the same CLI contract:
+
+```bash
+# your-judge --decide --question "..." --options "a,b,c" --state "..."
+# prints JSON: {"results": [{"choice": "...", "gate": "...", "confidence": 0.0-1.0}]}
+export VERA_JUDGE_SCRIPT=/path/to/your/judge-cli     # add to the profile's environment
+```
+
+Behavior:
+
+- **Not set / judge fails / times out / returns garbage** → VERA silently uses
+  the built-in local regex classifier. Nothing breaks; no store ever fails
+  because a judge call failed.
+- Explicit `vera_store` calls are **never dropped** by the judge — it may
+  re-categorize and re-weight, not discard. Only the automatic extraction
+  path can be gated shut.
+- The judge CLI is responsible for its own credentials. **VERA ships with no
+  API keys** and never writes credentials anywhere.
+
 ## Reference: a production memory block
 
 From a production profile (the `memory:` section):

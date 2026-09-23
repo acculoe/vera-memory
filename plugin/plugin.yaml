@@ -1,7 +1,7 @@
 name: vera_memory
-version: 5.0.0
+version: 5.6.1
 kind: exclusive
-description: "VERA Memory V5 — in-place upgrade: embedding self-heal to ~100% at startup, proactive recall triggers, session-start briefing, genuine persistence.md integration, correction resolution, real session summarizer + clean intake. SQLite FTS5 + ONNX semantic search."
+description: "VERA Memory V5.6.1 — governed per-agent memory: SQLite FTS5 + optional ONNX semantic search, automatic fact extraction with an optional pre-store classification judge (Jev or compatible open-weight judge via VERA_JUDGE_SCRIPT, fail-open), vera_forget withdrawal verb, canonical content hashing with a subject-free duplicate guard, data-hygiene migrations with full audit trail, term-ledger recall triggers ('say it, see it'), session briefing and persistence.md integration, correction resolution. No keys shipped; your credentials stay in your environment."
 hooks:
   - sync_turn
   - prefetch

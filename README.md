@@ -2,6 +2,10 @@
 
 **Persistent, governed memory for Hermes Agent profiles.**
 
+**Current release: V5.6.1** — see [PATCH-NOTES.md](PATCH-NOTES.md) for every
+change since V5.0.0 (duplicate guard, recall triggers, canonical hashing,
+classification judge, `vera_forget`, data hygiene).
+
 VERA (Verified Episodic Registry Architecture) replaces the default MEMORY.md
 memory system with a per-agent SQLite database: full-text search (FTS5), optional
 fully-local semantic search (ONNX embeddings), automatic fact extraction from
@@ -25,6 +29,10 @@ persona, branding, or data is included.
 - **Session briefing** — a "here's where you left off" block at every session start
 - **Persistent working memory** — a curated `persistence.md` that survives restarts
 - **Correction supersession** — storing a correction automatically demotes the stale fact it corrects
+- **Optional classification judge** — before content enters the durable store, a judge model decides store-vs-skip and category. Reference judge: **Jev** (`typesafe/jev-1.13`), or any compatible open-weight judge via `VERA_JUDGE_SCRIPT`. Fail-open to a local regex classifier when no judge is configured
+- **`vera_forget`** — a real withdrawal verb: retract a fact, it leaves every index, the audited row stays
+- **Duplicate guard** — exact-duplicate stores (same content, any subject) return the existing memory; no twin rows competing for recall slots
+- **Term-ledger recall triggers** — "mentioned N times since DATE" answers from indexed lookups, no LLM call
 - **Optional local semantic search** — all-MiniLM-L6-v2 INT8 (23 MB) runs 100% local via ONNX; graceful lexical-only fallback if the model is absent
 - **Self-healing embeddings** — startup coverage check rebuilds missing vectors automatically
 
@@ -76,6 +84,7 @@ start of every session.
 
 | File | Contents |
 |------|----------|
+| [`PATCH-NOTES.md`](PATCH-NOTES.md) | **What changed in 5.5.x / 5.6.x and how to upgrade** |
 | [`INSTALL-FOR-AGENTS.md`](INSTALL-FOR-AGENTS.md) | Step-by-step install script for an AI agent to execute |
 | [`docs/CONFIG.md`](docs/CONFIG.md) | Hermes config changes + eliminating the MEMORY.md conflict |
 | [`docs/USAGE.md`](docs/USAGE.md) | The agent protocol: identity, tools, persistence, session startup |
