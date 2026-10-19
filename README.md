@@ -1,5 +1,9 @@
 # VERA Memory V5
 
+[![Latest release](https://img.shields.io/github/v/release/acculoe/vera-memory)](https://github.com/acculoe/vera-memory/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+
 **Persistent, governed memory for Hermes Agent profiles.**
 
 **Current release: V5.6.1** — see [PATCH-NOTES.md](PATCH-NOTES.md) for every
@@ -13,9 +17,9 @@ every conversation, session-start briefing, working-memory persistence, and
 correction supersession. No cloud. No daemons. No external services. Your
 agent's memory stays on your machine.
 
-Built by [Acculoe FutureWorks](https://github.com/acculoe). This
-repository is the standalone, genericized public release — none of our internal
-persona, branding, or data is included.
+Built by [Acculoe FutureWorks](https://github.com/acculoe). Standalone and
+general-purpose — it installs into any Hermes profile, runs entirely on your
+own machine, and ships with no keys, accounts, or sample data of ours.
 
 ---
 
@@ -24,7 +28,7 @@ persona, branding, or data is included.
 - **SQLite + FTS5 storage** — one database per agent profile, zero server
 - **Automatic memory extraction** — facts, decisions, preferences, and corrections harvested from every turn
 - **Governed identity** — every memory belongs to a *principal* (the agent itself, or an enrolled human sender). Memories are never served to the wrong identity.
-- **Three agent tools** — `vera_search` (retrieve), `vera_store` (save), `vera_context` (focused context block)
+- **Four agent tools** — `vera_search` (retrieve), `vera_store` (save), `vera_context` (focused context block), `vera_forget` (withdraw)
 - **Proactive recall** — relevant memories injected automatically before each model call
 - **Session briefing** — a "here's where you left off" block at every session start
 - **Persistent working memory** — a curated `persistence.md` that survives restarts
@@ -84,7 +88,7 @@ start of every session.
 
 | File | Contents |
 |------|----------|
-| [`PATCH-NOTES.md`](PATCH-NOTES.md) | **What changed in 5.5.x / 5.6.x and how to upgrade** |
+| [`PATCH-NOTES.md`](PATCH-NOTES.md) | **Full change log since V5.0.0, including how to upgrade** |
 | [`INSTALL-FOR-AGENTS.md`](INSTALL-FOR-AGENTS.md) | Step-by-step install script for an AI agent to execute |
 | [`docs/CONFIG.md`](docs/CONFIG.md) | Hermes config changes + eliminating the MEMORY.md conflict |
 | [`docs/USAGE.md`](docs/USAGE.md) | The agent protocol: identity, tools, persistence, session startup |
