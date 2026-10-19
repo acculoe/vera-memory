@@ -55,7 +55,7 @@ print(open("vera_memory/plugin.yaml").read().split("version:")[1].split()[0])
 EOF
 ```
 
-Expected: `plugin import OK: .../__init__.py` and `5.6.1`. Any `SyntaxError` or `ImportError` → stop, report.
+Expected: `plugin import OK: .../__init__.py` and `5.6.2`. Any `SyntaxError` or `ImportError` → stop, report.
 
 ## Step 2 — Install Python dependencies
 

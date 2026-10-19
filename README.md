@@ -6,9 +6,9 @@
 
 **Persistent, governed memory for Hermes Agent profiles.**
 
-**Current release: V5.6.1** — see [PATCH-NOTES.md](PATCH-NOTES.md) for every
-change since V5.0.0 (duplicate guard, recall triggers, canonical hashing,
-classification judge, `vera_forget`, data hygiene).
+**Current release: V5.6.2** — see [PATCH-NOTES.md](PATCH-NOTES.md) for every
+change since V5.0.0 (scripted-payload guard, extraction telemetry, duplicate
+guard, recall triggers, classification judge, `vera_forget`, data hygiene).
 
 VERA (Verified Episodic Registry Architecture) replaces the default MEMORY.md
 memory system with a per-agent SQLite database: full-text search (FTS5), optional
@@ -36,6 +36,8 @@ own machine, and ships with no keys, accounts, or sample data of ours.
 - **Optional classification judge** — before content enters the durable store, a judge model decides store-vs-skip and category. Reference judge: **Jev** (`typesafe/jev-1.13`), or any compatible open-weight judge via `VERA_JUDGE_SCRIPT`. Fail-open to a local regex classifier when no judge is configured
 - **`vera_forget`** — a real withdrawal verb: retract a fact, it leaves every index, the audited row stays
 - **Duplicate guard** — exact-duplicate stores (same content, any subject) return the existing memory; no twin rows competing for recall slots
+- **Scripted-payload guard** — scheduled digests, status pings, and notification blobs are rejected before the judge ever sees them, so bot traffic can't become your agent's memories
+- **Honest extraction telemetry** — every turn logs candidates → survived judge → stored → deduped, and a session that stored nothing says *why* instead of a bare zero
 - **Term-ledger recall triggers** — "mentioned N times since DATE" answers from indexed lookups, no LLM call
 - **Optional local semantic search** — all-MiniLM-L6-v2 INT8 (23 MB) runs 100% local via ONNX; graceful lexical-only fallback if the model is absent
 - **Self-healing embeddings** — startup coverage check rebuilds missing vectors automatically
@@ -122,6 +124,17 @@ migration. See `migrator.py` and `safety.py` for the migration tooling, and
 
 If you previously used `vera-memory-system` (the file-based version): this
 plugin supersedes it. You do not need the old file structure.
+
+## Tests
+
+Behavioral tests ship with the plugin. They are fully synthetic — throwaway
+temp databases, no sample corpus, no credentials, no network:
+
+```bash
+python3 plugin/tests/test_v562_fixes.py    # payload guard, telemetry, judge gating
+python3 plugin/tests/test_dedupe_guard.py  # duplicate guard
+pytest plugin/tests/                       # or collect them as normal tests
+```
 
 ## License
 

@@ -348,6 +348,12 @@ class MemoryDB:
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = threading.RLock()
+        # v5.6.2: per-session extraction accounting. A session
+        # whose every candidate matched an existing memory writes ZERO rows and
+        # used to end with a false "stored ZERO memories" WARNING, which is
+        # indistinguishable in the log from an extraction outage. Keyed by
+        # source_session and popped by end_session, so it cannot grow.
+        self._session_store_stats: Dict[str, Dict[str, int]] = {}
 
     @staticmethod
     def needs_migration_at_path(db_path: Path) -> bool:
@@ -1331,6 +1337,12 @@ class MemoryDB:
         visibility: Optional[str] = None,
         deduplicate: bool = True,
         commit: bool = True,
+        # v5.6.2: out-param. The int return cannot distinguish a
+        # fresh INSERT from an exact-hash dedupe that handed back an EXISTING
+        # id, so callers counted stores that never happened. Pass a dict and
+        # read {"inserted": bool, "id": int}; it is only populated on the
+        # paths below, never inferred by the caller.
+        store_outcome: Optional[Dict[str, Any]] = None,
         _profile_global_capability: Optional[object] = None,
     ) -> int:
         clean = " ".join((content or "").split()).strip()
@@ -1397,6 +1409,11 @@ class MemoryDB:
             ).fetchone()
             if existing and deduplicate:
                 existing_id = int(existing["id"])
+                # v5.6.2: nothing is inserted on this path — say so to the
+                # caller instead of letting it count a store that never wrote
+                # a row ("stored=1 / memories_created=0").
+                if store_outcome is not None:
+                    store_outcome.update({"inserted": False, "id": existing_id})
                 if existing["subject_principal_id"] != subject_principal_id:
                     logger.info(
                         "vera v5.6.1: cross-subject exact duplicate (hash=%s, incoming subject=%s): "
@@ -1453,6 +1470,8 @@ class MemoryDB:
                     ),
                 )
                 memory_id = int(cursor.lastrowid)
+                if store_outcome is not None:
+                    store_outcome.update({"inserted": True, "id": memory_id})
                 conn.execute(
                     """INSERT INTO memory_provenance
                        (memory_id, source_type, source_locator, source_session,
@@ -1988,6 +2007,34 @@ class MemoryDB:
             self._get_conn().commit()
             return int(cursor.lastrowid)
 
+    def record_session_outcome(
+        self,
+        source_session: Optional[str],
+        *,
+        inserted: int = 0,
+        deduped: int = 0,
+        rejected_payload: int = 0,
+    ) -> None:
+        """v5.6.2: what extraction actually did with this session's candidates.
+
+        ``inserted`` counts rows written, ``deduped`` counts candidates that
+        matched an existing memory (near-duplicate or exact hash) and wrote
+        nothing, ``rejected_payload`` counts turns that were a scripted
+        envelope dropped before the judge (hourly fleet ping). Session end
+        needs all three to tell "extraction is broken" apart from "extraction
+        correctly refused to duplicate" apart from "this session was never
+        owner speech in the first place".
+        """
+        if not source_session:
+            return
+        with self._lock:
+            bucket = self._session_store_stats.setdefault(
+                str(source_session), {"inserted": 0, "deduped": 0, "rejected_payload": 0}
+            )
+            bucket["inserted"] += int(inserted)
+            bucket["deduped"] += int(deduped)
+            bucket["rejected_payload"] += int(rejected_payload)
+
     def store_extracted_memory(self, memory: Dict[str, Any]) -> Dict[str, Any]:
         """Store one extractor result with duplicate and correction precedence."""
         content = str(memory.get("content", "")).strip()
@@ -2007,6 +2054,7 @@ class MemoryDB:
             subject_principal_id=subject_principal_id,
         )
         if near:
+            self.record_session_outcome(memory.get("source_session"), deduped=1)
             return {"memory_id": int(near[0]["id"]), "action": "duplicate"}
 
         key = claim_key(content)
@@ -2037,7 +2085,20 @@ class MemoryDB:
                 memory_to_store["retrieval_enabled"] = False
                 action = "conflict_review"
 
-        memory_id = self.store_memory(**memory_to_store)
+        outcome: Dict[str, Any] = {}
+        memory_id = self.store_memory(store_outcome=outcome, **memory_to_store)
+        if outcome.get("inserted") is False:
+            # v5.6.2: store_memory's exact-hash dedupe handed back an EXISTING
+            # row (its lookup is subject-free and not limited to the 20 newest
+            # rows per category, so it sees matches find_near_duplicates
+            # missed). No row was written: reporting "stored" made the
+            # per-turn counter claim stored=1 while end_session counted 0 rows
+            # for this session and warned ZERO. Report it as what
+            # it is, and skip the conflict bookkeeping — there is no new row
+            # to hang a conflict on.
+            self.record_session_outcome(memory.get("source_session"), deduped=1)
+            return {"memory_id": memory_id, "action": "duplicate"}
+        self.record_session_outcome(memory.get("source_session"), inserted=1)
         if predecessor and action == "conflict_review":
             self.create_conflict_review(
                 predecessor["id"],
@@ -2120,9 +2181,53 @@ class MemoryDB:
                 "SELECT COUNT(*) AS cnt FROM memories WHERE source_session=?",
                 (session_id,),
             ).fetchone()["cnt"]
+            stats = self._session_store_stats.pop(str(session_id), None)
             conn.execute(
                 """UPDATE sessions SET ended_at=?, summary=?, turn_count=?, memories_created=?
                    WHERE session_id=?""",
                 (utcnow(), summary, int(turn_count), memories_created, session_id),
             )
             conn.commit()
+            # V5.6.1 failure visibility: the 2026-09 outage wrote memories_created=0
+            # for every session and left no log line anywhere, so the store looked
+            # healthy while carrying nothing. Always say what the session produced.
+            logger.info(
+                "VERA session end: session=%s turns=%d memories_created=%d",
+                session_id, int(turn_count), memories_created,
+            )
+            if not memories_created:
+                if stats and stats.get("deduped") and not stats.get("inserted"):
+                    # v5.6.2: extraction DID run on this session
+                    # and every candidate matched an existing memory, so
+                    # writing a row would have been a duplicate. That is a
+                    # healthy outcome, not the outage this WARNING exists to
+                    # catch — report it as INFO with the real reason.
+                    logger.info(
+                        "VERA session end: session=%s created 0 new rows "
+                        "(turns=%d): all %d extraction candidate(s) matched "
+                        "existing memories (dedupe) — extraction ran and "
+                        "correctly refused to duplicate, not a store failure",
+                        session_id, int(turn_count), int(stats["deduped"]),
+                    )
+                elif stats and stats.get("rejected_payload") and not stats.get("inserted"):
+                    # v5.6.2: every turn in this session was a
+                    # scripted envelope (the hourly fleet ping arrives as the
+                    # user message). Nothing durable was ever on offer, so 0
+                    # rows is the designed outcome — not the extraction outage
+                    # this WARNING is reserved for.
+                    logger.info(
+                        "VERA session end: session=%s created 0 new rows "
+                        "(turns=%d): %d turn(s) were scripted payload (fleet "
+                        "ping / query file) rejected before the judge — 0 "
+                        "candidates is the designed outcome, not an extraction "
+                        "failure",
+                        session_id, int(turn_count),
+                        int(stats["rejected_payload"]),
+                    )
+                else:
+                    logger.warning(
+                        "VERA session end: session=%s stored ZERO memories (turns=%d) — "
+                        "either this session had no durable claims, sync_turn never ran, "
+                        "or extraction was blocked; see the per-turn VERA auto-extract lines",
+                        session_id, int(turn_count),
+                    )

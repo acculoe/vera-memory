@@ -13,6 +13,52 @@ else:
 EXTRACTOR_VERSION = "atomic-user-v2"
 MAX_INPUT_CHARS = 4000
 MAX_MEMORY_CHARS = 500
+# Bounds Jev calls, DB writes, and prompt footprint for a single turn.
+MAX_CANDIDATES_PER_TURN = 8
+# Whole-message rejects: transport/system envelopes are never the owner talking.
+# `summarize_session` already skips `[`-prefixed blobs; extraction must too, or a
+# kanban/delegation notification is judged sentence-by-sentence and a borderline
+# verdict turns a bot notification into a "memory".
+INJECTED_PREFIXES = (
+    "[",
+    "gateway message origin",
+    "review the conversation above",
+)
+# Whole-message rejects by CONTENT, not only by start: scripted payloads that
+# arrive as if the owner were speaking. The hourly fleet digest
+# (a scheduled status ping — a query file fed to
+# `hermes chat --query-file`) is a query file, so it lands in sync_turn as a
+# plain user message and used to be judged sentence-by-sentence — three of its
+# template lines became memories in every polled profile.
+# Every marker below is verbatim template wording observed in the live corpus
+# or in the current file; a startswith check alone is not enough because the
+# transport layer may wrap the message before we see it.
+INJECTED_MARKERS = (
+    "status ping from",
+    "answer in exactly this format",
+    "working on — one or two sentences",
+    "working on - one or two sentences",
+    "based on your freshest vera record",
+    "based on your latest vera entries",
+    "concrete project/task you",
+    "do not answer from kanban board state",
+    "vera/memory/*.md file if your store has nothing",
+)
+
+
+def is_injected_payload(text: str) -> bool:
+    """True when the whole message is a scripted envelope, not owner speech.
+
+    Checked twice on purpose: extract_facts_from_turn drops such a payload
+    BEFORE the judge ever sees it, and sync_turn uses the same predicate to
+    tell session-end telemetry that 0 candidates here is by design — an hourly
+    fleet ping is not a session that failed to remember anything.
+    """
+    lowered = text.casefold() if isinstance(text, str) else ""
+    return lowered.startswith(INJECTED_PREFIXES) or any(
+        marker in lowered for marker in INJECTED_MARKERS
+    )
+
 
 DECISION_PATTERNS = [
     r"\b(?:i|we)\s+(?:decided?|agreed?|chose?|confirmed?|approved?)\b",
@@ -192,7 +238,10 @@ def extract_facts_from_turn(
     content = _strip_context_suffix(transport.content).strip()
     if not content or len(content) > MAX_INPUT_CHARS:
         return []
-    if content.casefold() in {"hi", "hello", "hey", "good morning", "thanks", "thank you"}:
+    lowered = content.casefold()
+    if is_injected_payload(content):
+        return []
+    if lowered in {"hi", "hello", "hey", "good morning", "thanks", "thank you"}:
         return []
 
     # The caller may already have resolved a trusted principal. A structured ID
@@ -205,33 +254,41 @@ def extract_facts_from_turn(
         if _is_transient_or_unsafe(sentence):
             continue
         memory_type = classify_memory_type(sentence)
-        if not memory_type:
-            continue
         redacted = redact_sensitive(sentence)
         key = redacted.casefold()
         if key in seen:
             continue
         seen.add(key)
-        memories.append(
-            {
-                "content": redacted,
-                "category": CATEGORY_BY_TYPE[memory_type],
-                "importance": IMPORTANCE_BY_TYPE[memory_type],
-                "source": "conversation",
-                "source_type": "authenticated_user" if trust_tier == "owner_declared" else "observed_chat",
-                "memory_layer": "l1",
-                "memory_type": memory_type,
-                "subject_principal_id": sender_principal_id,
-                "sender_principal_id": sender_principal_id,
-                "trust_tier": trust_tier,
-                # Unauthenticated observations remain auditable but cannot enter
-                # automatic retrieval or prompt context.
-                "retrieval_enabled": bool(is_authenticated and sender_principal_id),
-                "extractor_version": EXTRACTOR_VERSION,
-                "metadata": {
-                    "transport": transport.identity_source,
-                    "display_label_used_for_identity": False,
-                },
-            }
-        )
+        # A missing typed signal used to be an unconditional drop, which meant
+        # the judge never saw the owner's real phrasing at all: replaying a live
+        # gateway transcript, only 2 of 27 owner messages carried an explicit
+        # "I decide / I prefer / that's wrong" pattern.  Such a sentence now
+        # travels as ``judge_only`` and is stored ONLY when the Jev judge returns
+        # an explicit verdict for it (sync_turn enforces that; a Jev timeout or
+        # spent budget falls back to a drop, never to a blind store).
+        entry: Dict[str, Any] = {
+            "content": redacted,
+            "category": CATEGORY_BY_TYPE[memory_type] if memory_type else "facts",
+            "importance": IMPORTANCE_BY_TYPE[memory_type] if memory_type else 0.5,
+            "source": "conversation",
+            "source_type": "authenticated_user" if trust_tier == "owner_declared" else "observed_chat",
+            "memory_layer": "l1",
+            "memory_type": memory_type or "fact",
+            "subject_principal_id": sender_principal_id,
+            "sender_principal_id": sender_principal_id,
+            "trust_tier": trust_tier,
+            # Unauthenticated observations remain auditable but cannot enter
+            # automatic retrieval or prompt context.
+            "retrieval_enabled": bool(is_authenticated and sender_principal_id),
+            "extractor_version": EXTRACTOR_VERSION,
+            "metadata": {
+                "transport": transport.identity_source,
+                "display_label_used_for_identity": False,
+            },
+        }
+        if not memory_type:
+            entry["judge_only"] = True
+        memories.append(entry)
+        if len(memories) >= MAX_CANDIDATES_PER_TURN:
+            break
     return memories

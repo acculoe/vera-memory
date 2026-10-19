@@ -1,7 +1,7 @@
 name: vera_memory
-version: 5.6.1
+version: 5.6.2
 kind: exclusive
-description: "VERA Memory V5.6.1 — governed per-agent memory: SQLite FTS5 + optional ONNX semantic search, automatic fact extraction with an optional pre-store classification judge (Jev or compatible open-weight judge via VERA_JUDGE_SCRIPT, fail-open), vera_forget withdrawal verb, canonical content hashing with a subject-free duplicate guard, data-hygiene migrations with full audit trail, term-ledger recall triggers ('say it, see it'), session briefing and persistence.md integration, correction resolution. No keys shipped; your credentials stay in your environment."
+description: "VERA Memory V5.6.2 — governed per-agent memory: SQLite FTS5 + optional ONNX semantic search, automatic fact extraction gated by an optional classification judge (Jev or any compatible open-weight judge via VERA_JUDGE_SCRIPT, fail-open to local regex), scripted-payload guard that rejects digests/notifications before the judge sees them, per-turn and per-session extraction telemetry that tells a real store outage apart from an honest dedupe, exact-duplicate detection reported as what it really is on both store paths, judge category-to-type mapping for untyped candidates, automatic-path embedding fix, vera_forget withdrawal verb, subject-free duplicate guard, term-ledger recall triggers ('say it, see it'), session briefing and persistence.md integration, correction resolution. No keys shipped; your credentials stay in your environment."
 hooks:
   - sync_turn
   - prefetch

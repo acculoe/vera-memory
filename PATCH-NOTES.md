@@ -1,11 +1,58 @@
 # VERA Memory — Patch Notes
 
 This file describes every change since the original public **V5.0.0** release.
-Current version: **5.6.1**.
+Current version: **5.6.2**.
 
 ---
 
-## V5.6.1 — Duplicate guard (current)
+## V5.6.2 — Scripted-payload guard + honest extraction telemetry (current)
+
+**Why:** two production defects that a bare `memories_created=0` made
+invisible, plus one that silently cost you embeddings.
+
+- **Scripted payloads never reach the judge.** Scheduled digests, status
+  pings, kanban/delegation notifications, and query-file turns are rejected
+  *before* classification — by envelope prefix (`[name|id]`, gateway origin
+  headers) and by verbatim template wording. Bot traffic cannot become
+  memories, and a turn that produced nothing says *"scripted payload
+  rejected — 0 candidates is expected, not an extraction failure"* instead of
+  looking like an outage.
+- **Honest store accounting.** An exact-hash duplicate that returns an
+  existing row is now reported as what it is (`action: duplicate`, zero rows
+  written). Previously it was counted as a store, so per-turn counters claimed
+  `stored=1` while the session row said `memories_created=0` — the same log
+  signature as a real extraction failure.
+- **Per-session outcome stats.** Each session tracks inserted / deduped /
+  rejected-payload counts. `end_session` now distinguishes three cases that
+  used to collapse into one alarming WARNING: *"all candidates matched
+  existing memories"* (healthy), *"every turn was a scripted payload"*
+  (healthy), and a genuine `stored ZERO memories` (still a WARNING, with the
+  per-turn lines to look at).
+- **`judge_only` candidates.** A sentence with no typed signal ("I decided",
+  "that's wrong", …) is no longer dropped before the judge sees it — in a
+  live transcript replay only 2 of 27 real owner messages carried an explicit
+  typed pattern. It now travels to the judge and is stored **only** on an
+  explicit judge verdict; a judge timeout or spent budget drops it rather than
+  blind-storing it.
+- **Judge category → type mapping.** Judge-returned categories map onto the
+  extractor's `memory_type` vocabulary (decision / fact / preference /
+  correction); anything else lands as `fact` so the store default applies.
+- **Automatic-path embeddings fixed.** `store_extracted_memory` returns
+  `memory_id`, but the automatic extraction path read `id` — so rows created
+  by automatic extraction never triggered incremental embedding and sat at
+  `embedding_status='missing'` until the self-heal pass caught them.
+- **Failure visibility.** Skipped `sync_turn` / `on_session_end` (extraction
+  disabled, DB not open), every extraction turn's counts, and exceptions with
+  full tracebacks are now logged instead of failing silently.
+- **Judge prompt clarified.** The gate's context now spells out what counts
+  as durable (decisions, corrections, standing preferences, money facts,
+  project state) and what to skip (greetings, bare questions, tool output) —
+  a false SKIP is the expensive error.
+- No schema change; migrations stay at 11. Existing databases work as-is.
+
+---
+
+## V5.6.1 — Duplicate guard
 
 **The fix:** VERA's store-time duplicate check previously required both the
 same content **and** the same subject attribution. Identical content saved
@@ -132,15 +179,15 @@ cd /path/to/vera-memory && git pull
 cp -r plugin/* ~/.hermes/plugins/vera_memory/
 find ~/.hermes/plugins/vera_memory -name '__pycache__' -type d -exec rm -rf {} +
 # BACK UP your database first:
-cp ~/.hermes/profiles/<agent>/vera-memory/memory.db{,.pre-561.bak}
+cp ~/.hermes/profiles/<agent>/vera-memory/memory.db{,.pre-562.bak}
 # restart the gateway — migrations 9/10/11 run automatically at first start
 ```
 
-Verify after restart: `plugin.yaml` shows `version: 5.6.1`, the gateway log
+Verify after restart: `plugin.yaml` shows `version: 5.6.2`, the gateway log
 shows the migration lines, and `PRAGMA integrity_check` on your DB returns
 `ok`.
 
-Rollback: restore the `.pre-561.bak` file and the previous plugin files.
+Rollback: restore the `.pre-562.bak` file and the previous plugin files.
 
 ---
 

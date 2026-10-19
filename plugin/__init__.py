@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from agent.memory_provider import MemoryProvider
 
 if __package__:
-    from .extractor import extract_facts_from_turn
+    from .extractor import extract_facts_from_turn, is_injected_payload
     from .migrator import migrate_vera_files
     from .models import MemoryDB
     from .safety import prepare_live_migration_package
@@ -28,7 +28,7 @@ if __package__:
     from . import summarizer
     from . import classify as classify_mod
 else:  # Direct source-tree import used by the isolated regression harness.
-    from extractor import extract_facts_from_turn
+    from extractor import extract_facts_from_turn, is_injected_payload
     from migrator import migrate_vera_files
     from models import MemoryDB
     from safety import prepare_live_migration_package
@@ -42,6 +42,16 @@ else:  # Direct source-tree import used by the isolated regression harness.
     import classify as classify_mod
 
 logger = logging.getLogger(__name__)
+
+# Jev's category vocabulary -> the extractor's memory_type vocabulary.  Only the
+# four the typed regexes produce are mapped; every other judge category lands as
+# a plain "fact" so store_memory's default still applies.
+_JUDGE_CATEGORY_TO_TYPE: Dict[str, str] = {
+    "decisions": "decision",
+    "facts": "fact",
+    "preferences": "preference",
+    "corrections": "correction",
+}
 
 
 class VERAMemoryProvider(MemoryProvider):
@@ -543,6 +553,14 @@ class VERAMemoryProvider(MemoryProvider):
     def sync_turn(self, user: str, assistant: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None, **kwargs: Any) -> None:
         """Extract facts from this turn. Uses explicit session_id when provided."""
         if not self._extraction_enabled or not self._db:
+            # V5.6.1 failure visibility: this bare return used to be invisible, so a
+            # session could record memories_created=0 with nothing in the log to
+            # explain it. Say it out loud instead.
+            logger.warning(
+                "VERA sync_turn SKIPPED (extraction_enabled=%s, db_open=%s) — "
+                "this turn will NOT be extracted into memory",
+                self._extraction_enabled, bool(self._db),
+            )
             return
         # FIX #6: Use provided session_id, fall back to stored one
         active_session = session_id or self._session_id
@@ -563,42 +581,67 @@ class VERAMemoryProvider(MemoryProvider):
             # content reaches the store with nobody asserting durability, so
             # it is where a judge earns its keep: drop non-durable candidates
             # and repair dictation artifacts. The extractor keeps owning
-            # category/memory_type (they stay consistent with each other) so
-            # a failed judge degrades to exactly v5 behavior instead of
-            # losing memories — classify() falls back to regex, and regex
-            # never drops what the extractor already deemed durable.
+            # category/memory_type for TYPED candidates (they stay consistent
+            # with each other) so a failed judge degrades to exactly v5
+            # behavior instead of losing memories — classify() falls back to
+            # regex, and regex never drops what the extractor already deemed
+            # durable.  ``judge_only`` candidates are the opposite contract:
+            # no typed signal, so they survive ONLY on an explicit Jev verdict
+            # and a Jev outage drops them rather than blind-storing them.
+            _candidate_count = len(extracted)
             if extracted:
                 _kept = []
                 _dropped = 0
                 for mem in extracted:
+                    _untyped = bool(mem.pop("judge_only", False))
                     _verdict = classify_mod.classify(
                         str(mem.get("content", "")),
-                        category_hint=mem.get("category"),
+                        category_hint=None if _untyped else mem.get("category"),
                         caller_asserted=False,
                     )
                     if not _verdict["store"]:
                         _dropped += 1
                         continue
+                    if _untyped and _verdict.get("source") != "jev":
+                        # No Jev verdict (timeout / session budget / spawn
+                        # failure) -> classify() fell back to regex, whose
+                        # default bucket stores everything. Never let the
+                        # fallback create a memory the judge never saw.
+                        _dropped += 1
+                        continue
                     if _verdict["cleaned"]:
                         mem["content"] = _verdict["cleaned"]
+                    if _untyped:
+                        mem["category"] = _verdict["category"]
+                        mem["memory_type"] = _JUDGE_CATEGORY_TO_TYPE.get(
+                            _verdict["category"], "fact"
+                        )
+                        mem["importance"] = classify_mod.importance_for(
+                            _verdict["category"]
+                        )
                     _kept.append(mem)
                 if _dropped:
-                    logger.debug(
-                        "VERA v5.5: judge dropped %d non-durable candidate(s) this turn",
-                        _dropped,
+                    logger.info(
+                        "VERA auto-extract: judge dropped %d of %d candidate(s) this turn",
+                        _dropped, _candidate_count,
                     )
                 extracted = _kept
 
+            stored = 0
+            deduped = 0
+            new_ids = []
             if extracted:
-                stored = 0
-                new_ids = []
                 for mem in extracted:
                     mem["source_session"] = active_session
                     result = self._db.store_extracted_memory(mem)
                     if result["action"] != "duplicate":
                         stored += 1
-                        if "id" in result:
-                            new_ids.append(result["id"])
+                        # store_extracted_memory returns "memory_id" (not "id"),
+                        # so the incremental embed below never fired on the
+                        # automatic path and extracted rows stayed at
+                        # embedding_status='missing'.
+                        if result.get("memory_id"):
+                            new_ids.append(int(result["memory_id"]))
                         # V4.5: Add to working buffer for within-session continuity
                         if self._working_buffer:
                             self._working_buffer.add(
@@ -609,22 +652,72 @@ class VERAMemoryProvider(MemoryProvider):
                         # V4.5: Check if this should persist across sessions
                         if self._persistence:
                             self._persistence.add_entry(mem)
-                if stored > 0:
-                    logger.debug("VERA Memory: extracted %d facts from turn %d", stored, self._turn_count)
-                    # V4.5: Write persistence if updated
-                    if self._persistence:
-                        try:
-                            self._persistence.write()
-                        except Exception as e:
-                            logger.debug("VERA v4.5: Persistence write failed: %s", e)
-                    # V4: Generate embeddings for new memories
-                    if self._semantic_backend and new_ids:
-                        try:
-                            self._incremental_embed(new_ids)
-                        except Exception as e:
-                            logger.debug("VERA V4: Incremental embed failed: %s", e)
+                    else:
+                        # v5.6.2: a "duplicate" means store_memory
+                        # matched an existing row — near-duplicate or exact
+                        # hash — and wrote NOTHING. Counting it as a store is
+                        # what made this line claim stored=1 for sessions whose
+                        # row count was 0.
+                        deduped += 1
+            # A scripted envelope (hourly fleet ping / query file) is rejected
+            # by DESIGN, so 0 candidates there is a pass, not a fault. This
+            # WARNING exists to catch real extraction outages; spending it on
+            # payloads we meant to drop trains the reader to ignore it
+            _injected = bool(_candidate_count == 0 and is_injected_payload(user))
+            if _injected:
+                # Telemetry must never be able to abort the turn: everything
+                # here shares sync_turn's single try/except, so a failure in a
+                # bookkeeping call would cost the caller its log line and any
+                # remaining stores. Optional on purpose — the store interface
+                # sync_turn depends on is resolve_principal + store_extracted.
+                try:
+                    _record = getattr(self._db, "record_session_outcome", None)
+                    if callable(_record):
+                        _record(active_session, rejected_payload=1)
+                except Exception as e:
+                    logger.debug("VERA session-outcome telemetry skipped: %s", e)
+            # Unconditional per-turn telemetry: this is the line that would
+            # have shown the outage instead of a bare memories_created=0.
+            logger.info(
+                "VERA auto-extraction turn=%d session=%s candidates=%d "
+                "survived_judge=%d stored=%d deduped=%d",
+                self._turn_count, active_session, _candidate_count,
+                len(extracted), stored, deduped,
+            )
+            if stored == 0 and _candidate_count == 0:
+                if _injected:
+                    logger.info(
+                        "VERA auto-extraction turn=%d session=%s: scripted "
+                        "payload (%d chars) rejected pre-judge — 0 candidates "
+                        "is expected, not an extraction failure",
+                        self._turn_count, active_session, len(user or ""),
+                    )
+                else:
+                    logger.warning(
+                        "VERA auto-extraction produced 0 candidates this turn "
+                        "(session=%s, %d chars of user text) — extractor pre-filter "
+                        "rejected everything; check INJECTED_PREFIXES / "
+                        "MAX_INPUT_CHARS / typed patterns",
+                        active_session, len(user or ""),
+                    )
+            if stored > 0:
+                # V4.5: Write persistence if updated
+                if self._persistence:
+                    try:
+                        self._persistence.write()
+                    except Exception as e:
+                        logger.warning("VERA v4.5: Persistence write failed: %s", e)
+                # V4: Generate embeddings for new memories
+                if self._semantic_backend and new_ids:
+                    try:
+                        self._incremental_embed(new_ids)
+                    except Exception as e:
+                        logger.debug("VERA V4: Incremental embed failed: %s", e)
         except Exception as e:
-            logger.warning("VERA Memory extraction error: %s", e)
+            logger.warning(
+                "VERA Memory extraction error: session=%s turn=%d: %s",
+                session_id or self._session_id, self._turn_count, e, exc_info=True,
+            )
 
     def _incremental_embed(self, memory_ids: list) -> None:
         """Generate embeddings for specific memories (incremental)."""
@@ -780,6 +873,12 @@ class VERAMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         if not self._db:
+            # V5.6.1 failure visibility: without this, an uninitialized provider
+            # silently ends the session with memories_created left at 0.
+            logger.warning(
+                "VERA on_session_end SKIPPED (db not open) — session row will keep "
+                "memories_created=0 and no summary"
+            )
             return
         try:
             # V5: REAL extractive summary replaces the "Last topic" stub.
