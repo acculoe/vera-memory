@@ -6,9 +6,10 @@
 
 **Persistent, governed memory for Hermes Agent profiles.**
 
-**Current release: V5.6.2** — see [PATCH-NOTES.md](PATCH-NOTES.md) for every
-change since V5.0.0 (scripted-payload guard, extraction telemetry, duplicate
-guard, recall triggers, classification judge, `vera_forget`, data hygiene).
+**Current release: V5.7.0** — see [PATCH-NOTES.md](PATCH-NOTES.md) for every
+change since V5.0.0 (zero-setup identity on a fresh install, scripted-payload
+guard, extraction telemetry, duplicate guard, recall triggers, classification
+judge, `vera_forget`, data hygiene).
 
 VERA (Verified Episodic Registry Architecture) replaces the default MEMORY.md
 memory system with a per-agent SQLite database: full-text search (FTS5), optional
@@ -28,6 +29,7 @@ own machine, and ships with no keys, accounts, or sample data of ours.
 - **SQLite + FTS5 storage** — one database per agent profile, zero server
 - **Automatic memory extraction** — facts, decisions, preferences, and corrections harvested from every turn
 - **Governed identity** — every memory belongs to a *principal* (the agent itself, or an enrolled human sender). Memories are never served to the wrong identity.
+- **Zero-setup identity** — the agent's own principal is provisioned at startup from the profile Hermes hands it, so a brand-new install can store on its first turn. Human senders are still enrolled only by explicit operator action.
 - **Four agent tools** — `vera_search` (retrieve), `vera_store` (save), `vera_context` (focused context block), `vera_forget` (withdraw)
 - **Proactive recall** — relevant memories injected automatically before each model call
 - **Session briefing** — a "here's where you left off" block at every session start
@@ -44,8 +46,8 @@ own machine, and ships with no keys, accounts, or sample data of ours.
 
 ## Requirements
 
-- [Hermes Agent](https://hermes-agent.nousresearch.com/docs) — macOS, Linux, or Windows
-- Python 3.10+
+- [Hermes Agent](https://hermes-agent.nousresearch.com/docs) 0.21 or newer (this release is verified against 0.23.3) — macOS, Linux, or Windows
+- Python 3.10+ (verified on 3.12 and on the 3.14 that current Hermes installs)
 - `onnxruntime` and `numpy` (see `requirements.txt`) — for semantic search
 
 ## Install (human, ~5 minutes)
@@ -131,6 +133,7 @@ Behavioral tests ship with the plugin. They are fully synthetic — throwaway
 temp databases, no sample corpus, no credentials, no network:
 
 ```bash
+python3 plugin/tests/test_v570_compat.py   # fresh-install identity + manifest version
 python3 plugin/tests/test_v562_fixes.py    # payload guard, telemetry, judge gating
 python3 plugin/tests/test_dedupe_guard.py  # duplicate guard
 pytest plugin/tests/                       # or collect them as normal tests

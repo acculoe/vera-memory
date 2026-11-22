@@ -4,6 +4,10 @@
 
 **Total time:** ~10 minutes. **Everything runs locally.** No daemon, no server, no cloud.
 
+**Hermes version:** written against the Hermes memory-provider contract as of
+**Hermes Agent 0.23.3**, and works on 0.21+. On anything older than 0.21, stop
+and report the version instead of improvising around a different plugin API.
+
 **Convention used below:** `<agent-name>` means the name of the Hermes profile this agent runs under. Substitute it literally (e.g. `myagent`) in commands.
 
 ---
@@ -13,7 +17,8 @@
 Run these and read the outputs before touching anything:
 
 ```bash
-python3 --version                 # must be 3.10+
+python3 --version                 # must be 3.10+ (3.14 is what current Hermes installs)
+hermes --version                  # must be 0.21+ (this guide is verified on 0.23.3)
 ls ~/.hermes/                     # Hermes must already be installed
 python3 -c "import onnxruntime, numpy; print('semantic deps OK')" 2>/dev/null || echo "semantic deps missing — install in Step 2"
 echo "HERMES_HOME=${HERMES_HOME:-unset}"
@@ -55,14 +60,21 @@ print(open("vera_memory/plugin.yaml").read().split("version:")[1].split()[0])
 EOF
 ```
 
-Expected: `plugin import OK: .../__init__.py` and `5.6.2`. Any `SyntaxError` or `ImportError` → stop, report.
+Expected: `plugin import OK: .../__init__.py` and `5.7.0`. Any `SyntaxError` or `ImportError` → stop, report.
 
 ## Step 2 — Install Python dependencies
 
 ```bash
-pip install --user onnxruntime numpy 2>/dev/null || pip install onnxruntime numpy
+# PEP 668 (Ubuntu 24.04+, Mint 22+, Debian 12+) refuses a plain system pip install.
+# Install into an interpreter, not into a refusal message:
+python3 -m pip install --user onnxruntime numpy 2>/dev/null \
+  || uv pip install onnxruntime numpy \
+  || python3 -m pip install --break-system-packages onnxruntime numpy
 python3 -c "import onnxruntime, numpy; print('OK')"
 ```
+
+If all three fail, skip this step — VERA runs in lexical-only mode and logs the
+reason. Do not improvise a different package source.
 
 ## Step 3 — Configure Hermes
 
@@ -76,6 +88,11 @@ memory:
 ```
 
 If a `plugins.enabled` list exists, adding `vera_memory` to it is harmless but **not required and not sufficient by itself**.
+
+> **Do not run `hermes memory setup` from an agent session** — it is an
+> interactive picker that waits on a terminal. Edit the config file directly as
+> shown above. (A human operator may use `hermes memory setup --provider
+> vera_memory`.)
 
 **Then eliminate the MEMORY.md conflict.** The Hermes framework injects `memories/MEMORY.md` into every turn and it overrides VERA. Replace its contents with a pointer (keep a backup):
 
@@ -101,11 +118,13 @@ ls -la model_int8.onnx   # expect roughly 23 MB
 
 If the download fails (offline machine?), skip this step — VERA will log `lexical-only mode` at startup and everything else still works. You can add the model later and run the backfill worker (see `docs/ONNX-SEMANTIC.md`).
 
-## Step 5 — Provision identity + end-to-end round-trip probe
+## Step 5 — Confirm identity + end-to-end round-trip probe
 
-Every memory belongs to a *principal* — an identity record `(platform, subject_id)`. Your agent's own principal is `("hermes", "<agent-name>")`. Without it, `vera_store` fails closed with "authenticated, provisioned sender is required" — that is the security model working, not a bug.
+Every memory belongs to a *principal* — an identity record `(platform, subject_id)`. Your agent's own principal is `("hermes", "<agent-name>")`, and **VERA provisions it at startup** from the `agent_identity` Hermes passes (normally the profile name). There is no enrollment step for the agent itself: a brand-new install can store on its first turn.
 
-The script below uses the provider's own path-resolution logic (its `initialize()`), so the database is created at **exactly the path the runtime will use**, whatever your install shape:
+Human principals are different — they are enrolled only by an explicit operator action (the one-line example at the end of this step). Never enroll a sender just because they messaged the agent.
+
+The script below uses the provider's own path-resolution logic (its `initialize()`), so the database is created at **exactly the path the runtime will use**, whatever your install shape. It also re-states the principal explicitly, which is harmless and proves the startup provisioning worked:
 
 ```bash
 cd ~/.hermes/plugins && VERA_AGENT_NAME='<agent-name>' python3 - <<'EOF'
@@ -131,7 +150,7 @@ print(f"database at: {db_path}")
 EOF
 ```
 
-Expected: `agent principal provisioned: ('hermes', '<agent-name>') -> id 1` plus the database path. Write the agent name down — it must match what the gateway passes as `agent_identity` (normally the profile name).
+Expected: `agent principal provisioned: ('hermes', '<agent-name>') -> id 1` plus the database path. The agent name must match what the gateway passes as `agent_identity` (normally the profile name).
 
 **Probe 2 — full round trip** (store → search through the exact tool path the gateway uses):
 
@@ -156,7 +175,12 @@ print("SEARCH ->", out2)
 EOF
 ```
 
-Expected: `STORE -> Memory stored (id: 1).` and `SEARCH ->` a block containing that memory. If instead you see "authenticated, provisioned sender is required", the agent name used here doesn't match the one provisioned in the previous script — check for typos and rerun.
+Expected: `STORE -> Memory stored (id: 1).` and `SEARCH ->` a block containing that memory.
+
+If instead you see "authenticated, provisioned sender is required", the gateway
+is passing an `agent_identity` that does not match the profile name. Check for
+typos and report it — do not "fix" this by enrolling a principal for a name you
+invented.
 
 To enroll a **human** (e.g. the operator's Telegram account) later, run the provisioning script with this line added after `db.connect()`:
 
@@ -201,7 +225,8 @@ From now on, at the start of **every genuinely new session**: run the startup se
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `vera_store` → "authenticated, provisioned sender is required" | No principal for the calling identity | Step 5; verify the gateway passes `agent_identity` matching the profile name |
+| `vera_store` → "authenticated, provisioned sender is required" | The gateway passed no `agent_identity`, or it does not match the profile name | Step 5; verify the gateway passes `agent_identity` matching the profile name |
+| Provider reported unavailable on a brand-new install | Older build required `profiles/` to exist before the first run | Update to 5.7.0 — `is_available` now accepts any writable Hermes home |
 | No `vera_*` tools at all | Provider never registered | Check `memory.provider: vera_memory` spelling; restart gateway; check `hermes plugins list` finds the plugin dir |
 | Plugin loads but tools missing | `HERMES_HOME` profile-scoping confusion | The plugin handles profile-scoped homes; verify Hermes passes `agent_identity`/`hermes_home` kwargs at `initialize()` |
 | Lexical-only mode in logs | Model file missing/corrupt | Repeat Step 4; check file size ≈23 MB |

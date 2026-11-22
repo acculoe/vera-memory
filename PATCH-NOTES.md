@@ -1,11 +1,51 @@
 # VERA Memory — Patch Notes
 
 This file describes every change since the original public **V5.0.0** release.
-Current version: **5.6.2**.
+Current version: **5.7.0**.
 
 ---
 
-## V5.6.2 — Scripted-payload guard + honest extraction telemetry (current)
+## V5.7.0 — Zero-setup identity + Hermes 0.23 compatibility (current)
+
+**Why:** the plugin had never been exercised against a Hermes newer than 0.21,
+and two fresh-install defects meant a brand-new agent's first day looked like a
+broken product:
+
+- **First-turn stores failed on a clean install.** `vera_store` requires a
+  provisioned principal, and the agent's own principal was only created by a
+  manual script in the install guide. Hermes already hands the provider a
+  trusted `agent_identity` (the profile name), so **VERA now provisions the
+  agent's own principal at startup**. A new profile can remember from its first
+  turn with no enrollment step. Human senders are still enrolled only by
+  explicit operator action — the security model is unchanged, and a sender who
+  merely messaged the agent is never enrolled.
+- **A brand-new install reported the provider as unavailable.**
+  `is_available()` required `<hermes_home>/profiles/` to already exist, which is
+  false until the first profile runs. It now accepts any existing, writable
+  Hermes home and lets `initialize()` create the profile directory.
+- **The agent-facing prompt block advertised "v5.5"** three releases after that
+  stopped being true (the prefetch header and `system_prompt_block` were
+  hardcoded). Both now read the version from `plugin.yaml`, so the label the
+  agent sees always matches the installed release.
+- **Verified against Hermes 0.23.3** (the current release line): the plugin
+  loads through 0.23.3's real provider loader, is discovered as
+  `vera_memory`, registers its four tools, initializes, stores, searches and
+  shuts down. Hermes 0.21+ remains supported; the memory-provider contract this
+  plugin implements (abstract `name`/`is_available`/`initialize`/
+  `get_tool_schemas`, optional `system_prompt_block`/`prefetch`/`sync_turn`/
+  `on_session_end`/`on_memory_write`/`shutdown`) is unchanged.
+- **Install guide corrected for current systems:** PEP 668 `externally-managed-
+  environment` install path (`uv pip` / venv), a `hermes --version` check, a
+  warning that `hermes memory setup` is interactive and must not be run from an
+  agent session, and Step 5 rewritten now that identity is automatic.
+- **Tests:** `tests/test_v570_compat.py` adds three checks — manifest version
+  matches the prompt block, a fresh home with no `profiles/` reports available,
+  and the first-turn store/search round trip works without manual provisioning.
+- No schema change; migrations stay at 11. Existing databases work as-is.
+
+---
+
+## V5.6.2 — Scripted-payload guard + honest extraction telemetry
 
 **Why:** two production defects that a bare `memories_created=0` made
 invisible, plus one that silently cost you embeddings.

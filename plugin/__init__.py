@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -52,6 +53,26 @@ _JUDGE_CATEGORY_TO_TYPE: Dict[str, str] = {
     "preferences": "preference",
     "corrections": "correction",
 }
+
+
+def _plugin_version() -> str:
+    """Version from this plugin's own manifest — never a hardcoded label.
+
+    The agent-facing prompt block used to say "v5.5" for three releases after
+    that stopped being true; a stale version there reads as a broken install.
+    """
+    try:
+        manifest = Path(__file__).with_name("plugin.yaml").read_text(encoding="utf-8-sig")
+        for line in manifest.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("version:"):
+                return stripped.split(":", 1)[1].strip().strip("'\"")
+    except Exception:
+        pass
+    return "unknown"
+
+
+_VERSION = _plugin_version()
 
 
 class VERAMemoryProvider(MemoryProvider):
@@ -101,7 +122,12 @@ class VERAMemoryProvider(MemoryProvider):
         return "vera-memory"
 
     def is_available(self) -> bool:
-        """Check whether the resolved Hermes profile storage is writable."""
+        """Whether this profile's Hermes home exists and is writable.
+
+        A brand-new install has no `profiles/` directory yet — VERA creates it
+        on first initialize().  Requiring it here made every fresh profile
+        report the provider as unavailable before it had ever run.
+        """
         try:
             # An unset environment variable must fall back to ~/.hermes. Path("")
             # resolves to the process working directory, which makes Dashboard-side
@@ -110,14 +136,7 @@ class VERAMemoryProvider(MemoryProvider):
             hermes_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".hermes"
             if not hermes_home.exists():
                 hermes_home = Path.home() / ".hermes"
-            # Handle profile-scoped HERMES_HOME (e.g. profiles/phil)
-            hermes_str = str(hermes_home).replace("\\", "/")
-            if hermes_str.endswith("/profiles") or hermes_str.count("/profiles/") >= 1:
-                # Already points at or below profiles/ — use as-is
-                test_dir = hermes_home
-            else:
-                test_dir = hermes_home / "profiles"
-            return test_dir.exists() and os.access(str(test_dir), os.W_OK)
+            return hermes_home.is_dir() and os.access(str(hermes_home), os.W_OK)
         except Exception:
             return False
 
@@ -172,6 +191,26 @@ class VERAMemoryProvider(MemoryProvider):
                 raise RuntimeError("verified live migration package is required")
         self._db = MemoryDB(db_path)
         self._db.connect()
+
+        # V5.7: an agent must be able to remember from its very first turn.
+        # Hermes supplies `agent_identity` from trusted local profile config, so
+        # the agent's OWN principal is provisioned here, at startup. Human
+        # senders are still enrolled only by an explicit operator action — this
+        # never enrolls anyone who merely messaged the agent.
+        try:
+            _own_ident = str(kwargs.get("agent_identity") or kwargs.get("profile") or "").strip()
+            if _own_ident and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _own_ident):
+                _own_pid = self._db.upsert_principal(
+                    platform="hermes",
+                    platform_subject_id=_own_ident,
+                    principal_type="agent",
+                )
+                logger.info(
+                    "VERA v5.7: agent principal ready ('hermes', %r) -> id %s",
+                    _own_ident, _own_pid,
+                )
+        except Exception as e:  # never block session start on provisioning
+            logger.warning("VERA v5.7: agent principal provisioning skipped: %s", e)
 
         # Initialize ONNX semantic backend for V4 (MUST be after DB connect)
         self._semantic_backend = kwargs.get("semantic_backend")
@@ -867,7 +906,7 @@ class VERAMemoryProvider(MemoryProvider):
         buf_size = len(self._working_buffer) if self._working_buffer else 0
         persist_size = len(self._persistence._entries) if self._persistence else 0
         return (
-            f"## VERA v5.5 — {count} memories, "
+            f"## VERA v{_VERSION} — {count} memories, "
             f"{buf_size} working, {persist_size} persistent"
         )
 
@@ -936,7 +975,7 @@ class VERAMemoryProvider(MemoryProvider):
         per-message work.
         """
         lines = [
-            "\n## VERA Memory (v5.5)\n"
+            f"\n## VERA Memory (v{_VERSION})\n"
             "Memory system active. `vera_search` to recall, `vera_store` to save,\n"
             "`vera_forget` to withdraw a fact the owner no longer wants recalled.\n"
             "Facts extracted automatically; a Jev judge classifies what is kept.\n"
